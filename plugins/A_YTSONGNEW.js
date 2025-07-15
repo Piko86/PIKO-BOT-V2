@@ -91,7 +91,7 @@ cmd(
       await robin.sendMessage(
         from,
         {
-          audio: { url: songData.download.url },
+          audio: { url: songData.download.url1 },
           mimetype: "audio/mpeg",
         },
         { quoted: mek }
@@ -100,7 +100,7 @@ cmd(
       await robin.sendMessage(
         from,
         {
-          document: { url: songData.download.url },
+          document: { url: songData.download.url1 },
           mimetype: "audio/mpeg",
           fileName: `${data.title}.mp3`,
           caption: "𝐌𝐚𝐝𝐞 𝐛𝐲 *P_I_K_O* 💜",
