@@ -3,6 +3,7 @@ const yts = require("yt-search");
 const ytdl = require("ytdl-core");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 
 // Helper function to format duration
 function formatDuration(seconds) {
@@ -25,39 +26,63 @@ function formatFileSize(bytes) {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
 }
 
+// Helper function to sanitize filename
+function sanitizeFilename(filename) {
+  return filename
+    .replace(/[^\w\s-]/g, '') // Remove special characters
+    .replace(/\s+/g, '_') // Replace spaces with underscores
+    .substring(0, 50); // Limit length
+}
+
 // Helper function to safely create directory
 function ensureDirectoryExists(dirPath) {
   try {
+    // First, check if path exists and what it is
+    if (fs.existsSync(dirPath)) {
+      const stats = fs.statSync(dirPath);
+      if (!stats.isDirectory()) {
+        // If it's a file, remove it first
+        fs.unlinkSync(dirPath);
+      }
+    }
+    
+    // Create directory if it doesn't exist
     if (!fs.existsSync(dirPath)) {
       fs.mkdirSync(dirPath, { recursive: true });
     }
+    
+    return true;
   } catch (error) {
     console.error('Error creating directory:', error);
+    return false;
   }
 }
 
 // Helper function to safely clean up files
-function cleanupFiles(dirPath) {
+function cleanupFiles(filePath) {
   try {
-    if (fs.existsSync(dirPath)) {
-      const stats = fs.statSync(dirPath);
-      if (stats.isDirectory()) {
-        const files = fs.readdirSync(dirPath);
-        files.forEach(file => {
-          const filePath = path.join(dirPath, file);
-          try {
-            if (fs.existsSync(filePath)) {
-              fs.unlinkSync(filePath);
-            }
-          } catch (err) {
-            console.error('Error deleting file:', err);
-          }
-        });
+    if (fs.existsSync(filePath)) {
+      const stats = fs.statSync(filePath);
+      if (stats.isFile()) {
+        fs.unlinkSync(filePath);
       }
     }
   } catch (error) {
     console.error('Error during cleanup:', error);
   }
+}
+
+// Helper function to get a safe temp directory
+function getSafeTempDir() {
+  const baseDir = os.tmpdir();
+  const tempDir = path.join(baseDir, 'piko_bot_temp');
+  
+  if (ensureDirectoryExists(tempDir)) {
+    return tempDir;
+  }
+  
+  // Fallback to system temp
+  return baseDir;
 }
 
 cmd(
@@ -113,6 +138,11 @@ cmd(
       if (q.includes("youtube.com") || q.includes("youtu.be")) {
         videoUrl = q;
         try {
+          // Validate URL first
+          if (!ytdl.validateURL(videoUrl)) {
+            return reply("❌ *Invalid YouTube URL*");
+          }
+          
           const info = await ytdl.getInfo(videoUrl);
           videoData = {
             title: info.videoDetails.title,
@@ -130,17 +160,28 @@ cmd(
             }
           };
         } catch (error) {
-          return reply("❌ *Invalid YouTube URL or video not accessible*");
+          console.error('URL validation error:', error);
+          return reply("❌ *Invalid YouTube URL or video not accessible*\n\n💡 Try searching by song name instead");
         }
       } else {
         // Search for the song
-        const search = await yts(q);
-        if (!search.videos || search.videos.length === 0) {
-          return reply("❌ *No songs found for your search query*");
+        try {
+          const search = await yts(q);
+          if (!search.videos || search.videos.length === 0) {
+            return reply("❌ *No songs found for your search query*\n\n💡 Try different keywords");
+          }
+          
+          videoData = search.videos[0];
+          videoUrl = videoData.url;
+          
+          // Validate the found URL
+          if (!ytdl.validateURL(videoUrl)) {
+            return reply("❌ *Found video is not accessible*\n\n💡 Try a different search term");
+          }
+        } catch (error) {
+          console.error('Search error:', error);
+          return reply("❌ *Search failed*\n\n💡 Try again with different keywords");
         }
-        
-        videoData = search.videos[0];
-        videoUrl = videoData.url;
       }
 
       // Validate video duration (limit: 10 minutes for better performance)
@@ -175,11 +216,10 @@ cmd(
         { quoted: mek }
       );
 
-      // Create temp directory safely
-      const tempDir = path.join(__dirname, 'temp');
-      ensureDirectoryExists(tempDir);
-
-      const fileName = `${Date.now()}_${videoData.title.replace(/[^\w\s]/gi, '').substring(0, 50)}`;
+      // Get safe temp directory
+      const tempDir = getSafeTempDir();
+      const sanitizedTitle = sanitizeFilename(videoData.title);
+      const fileName = `${Date.now()}_${sanitizedTitle}`;
       const audioPath = path.join(tempDir, `${fileName}.mp4`);
 
       // Download audio directly without FFmpeg conversion
@@ -218,6 +258,12 @@ cmd(
       const fileStats = fs.statSync(audioPath);
       const fileSize = formatFileSize(fileStats.size);
 
+      // Check file size (limit: 50MB for WhatsApp)
+      if (fileStats.size > 50 * 1024 * 1024) {
+        cleanupFiles(audioPath);
+        return reply("📁 *File too large for WhatsApp*\n\n⚠️ Maximum size: 50MB\n💡 Try a shorter song");
+      }
+
       // Send audio file
       await robin.sendMessage(
         from,
@@ -245,7 +291,7 @@ cmd(
         {
           document: fs.readFileSync(audioPath),
           mimetype: "audio/mp4",
-          fileName: `${videoData.title.substring(0, 50)}.mp4`,
+          fileName: `${sanitizedTitle}.mp4`,
           caption: `🎵 *${videoData.title}*\n\n📊 *Size:* ${fileSize}\n⏱️ *Duration:* ${videoData.duration?.timestamp}\n\n*Made by P_I_K_O* 💜`,
         },
         { quoted: mek }
@@ -253,13 +299,7 @@ cmd(
 
       // Clean up temporary file after a delay
       setTimeout(() => {
-        try {
-          if (fs.existsSync(audioPath)) {
-            fs.unlinkSync(audioPath);
-          }
-        } catch (err) {
-          console.error('Error cleaning up file:', err);
-        }
+        cleanupFiles(audioPath);
       }, 30000); // Delete after 30 seconds
 
       return reply("✅ *DOWNLOAD COMPLETED SUCCESSFULLY!*");
@@ -267,10 +307,6 @@ cmd(
     } catch (error) {
       console.error('Song download error:', error);
       
-      // Clean up any temporary files on error
-      const tempDir = path.join(__dirname, 'temp');
-      cleanupFiles(tempDir);
-
       let errorMessage = "❌ *Download failed!*\n\n";
       
       if (error.message.includes('Video unavailable') || error.statusCode === 410) {
@@ -283,6 +319,8 @@ cmd(
         errorMessage += "🌐 *Network connection error*";
       } else if (error.statusCode === 403) {
         errorMessage += "🔒 *Access denied - video may be restricted*";
+      } else if (error.code === 'ENOTDIR' || error.code === 'ENOENT') {
+        errorMessage += "📁 *File system error - trying again may help*";
       } else {
         errorMessage += `🔧 *Error:* ${error.message}`;
       }
