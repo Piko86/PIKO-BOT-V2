@@ -68,9 +68,10 @@ cmd(
         { quoted: mek }
       );
 
+      const url1 = await ytmp3(data.url);
       const quality = "128";
-      const songData = await ytmp3(url, quality);
-      if (!songData?.download?.url) return reply("❌ Failed to get the download link.");
+      const songData = await ytmp3(url1,quality);
+      if (!songData?.download?.data.url1) return reply("❌ Failed to get the download link.");
 
       // Safely calculate duration
       let durationInSeconds = 0;
