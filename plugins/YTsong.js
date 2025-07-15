@@ -3,8 +3,6 @@ const yts = require("yt-search");
 const ytdl = require("ytdl-core");
 const fs = require("fs");
 const path = require("path");
-const { promisify } = require("util");
-const ffmpeg = require("fluent-ffmpeg");
 
 // Helper function to format duration
 function formatDuration(seconds) {
@@ -25,6 +23,41 @@ function formatFileSize(bytes) {
   const sizes = ['Bytes', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+// Helper function to safely create directory
+function ensureDirectoryExists(dirPath) {
+  try {
+    if (!fs.existsSync(dirPath)) {
+      fs.mkdirSync(dirPath, { recursive: true });
+    }
+  } catch (error) {
+    console.error('Error creating directory:', error);
+  }
+}
+
+// Helper function to safely clean up files
+function cleanupFiles(dirPath) {
+  try {
+    if (fs.existsSync(dirPath)) {
+      const stats = fs.statSync(dirPath);
+      if (stats.isDirectory()) {
+        const files = fs.readdirSync(dirPath);
+        files.forEach(file => {
+          const filePath = path.join(dirPath, file);
+          try {
+            if (fs.existsSync(filePath)) {
+              fs.unlinkSync(filePath);
+            }
+          } catch (err) {
+            console.error('Error deleting file:', err);
+          }
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error during cleanup:', error);
+  }
 }
 
 cmd(
@@ -142,35 +175,39 @@ cmd(
         { quoted: mek }
       );
 
-      // Download and convert audio
+      // Create temp directory safely
       const tempDir = path.join(__dirname, 'temp');
-      if (!fs.existsSync(tempDir)) {
-        fs.mkdirSync(tempDir, { recursive: true });
-      }
+      ensureDirectoryExists(tempDir);
 
       const fileName = `${Date.now()}_${videoData.title.replace(/[^\w\s]/gi, '').substring(0, 50)}`;
-      const audioPath = path.join(tempDir, `${fileName}.mp3`);
+      const audioPath = path.join(tempDir, `${fileName}.mp4`);
 
-      // Download audio using ytdl-core
+      // Download audio directly without FFmpeg conversion
       const audioStream = ytdl(videoUrl, {
         filter: 'audioonly',
         quality: 'highestaudio',
         format: 'mp4'
       });
 
-      // Convert to MP3 using ffmpeg
+      // Save the audio file
+      const writeStream = fs.createWriteStream(audioPath);
+      
       await new Promise((resolve, reject) => {
-        ffmpeg(audioStream)
-          .audioBitrate(128)
-          .format('mp3')
-          .on('error', (err) => {
-            console.error('FFmpeg error:', err);
-            reject(err);
-          })
-          .on('end', () => {
-            resolve();
-          })
-          .save(audioPath);
+        audioStream.pipe(writeStream);
+        
+        audioStream.on('error', (err) => {
+          console.error('Download error:', err);
+          reject(err);
+        });
+        
+        writeStream.on('finish', () => {
+          resolve();
+        });
+        
+        writeStream.on('error', (err) => {
+          console.error('Write error:', err);
+          reject(err);
+        });
       });
 
       // Check if file was created successfully
@@ -186,7 +223,7 @@ cmd(
         from,
         {
           audio: fs.readFileSync(audioPath),
-          mimetype: "audio/mpeg",
+          mimetype: "audio/mp4",
           ptt: false,
           contextInfo: {
             externalAdReply: {
@@ -207,17 +244,21 @@ cmd(
         from,
         {
           document: fs.readFileSync(audioPath),
-          mimetype: "audio/mpeg",
-          fileName: `${videoData.title.substring(0, 50)}.mp3`,
+          mimetype: "audio/mp4",
+          fileName: `${videoData.title.substring(0, 50)}.mp4`,
           caption: `🎵 *${videoData.title}*\n\n📊 *Size:* ${fileSize}\n⏱️ *Duration:* ${videoData.duration?.timestamp}\n\n*Made by P_I_K_O* 💜`,
         },
         { quoted: mek }
       );
 
-      // Clean up temporary file
+      // Clean up temporary file after a delay
       setTimeout(() => {
-        if (fs.existsSync(audioPath)) {
-          fs.unlinkSync(audioPath);
+        try {
+          if (fs.existsSync(audioPath)) {
+            fs.unlinkSync(audioPath);
+          }
+        } catch (err) {
+          console.error('Error cleaning up file:', err);
         }
       }, 30000); // Delete after 30 seconds
 
@@ -228,31 +269,25 @@ cmd(
       
       // Clean up any temporary files on error
       const tempDir = path.join(__dirname, 'temp');
-      if (fs.existsSync(tempDir)) {
-        const files = fs.readdirSync(tempDir);
-        files.forEach(file => {
-          const filePath = path.join(tempDir, file);
-          if (fs.existsSync(filePath)) {
-            fs.unlinkSync(filePath);
-          }
-        });
-      }
+      cleanupFiles(tempDir);
 
       let errorMessage = "❌ *Download failed!*\n\n";
       
-      if (error.message.includes('Video unavailable')) {
-        errorMessage += "🚫 *Video is not available or private*";
+      if (error.message.includes('Video unavailable') || error.statusCode === 410) {
+        errorMessage += "🚫 *Video is not available, private, or has been removed*";
       } else if (error.message.includes('age-restricted')) {
         errorMessage += "🔞 *Video is age-restricted*";
       } else if (error.message.includes('copyright')) {
         errorMessage += "⚖️ *Video has copyright restrictions*";
-      } else if (error.message.includes('network')) {
+      } else if (error.message.includes('network') || error.code === 'ENOTFOUND') {
         errorMessage += "🌐 *Network connection error*";
+      } else if (error.statusCode === 403) {
+        errorMessage += "🔒 *Access denied - video may be restricted*";
       } else {
         errorMessage += `🔧 *Error:* ${error.message}`;
       }
       
-      errorMessage += "\n\n💡 *Try:*\n• Different search terms\n• Another song\n• Check your internet connection";
+      errorMessage += "\n\n💡 *Try:*\n• Different search terms\n• Another song\n• Check your internet connection\n• Try again in a few minutes";
       
       return reply(errorMessage);
     }
