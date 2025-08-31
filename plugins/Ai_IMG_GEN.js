@@ -1,50 +1,93 @@
 const { cmd } = require("../command");
 const axios = require("axios");
 
-async function fetchAIImage(prompt) {
-  const encodedPrompt = encodeURIComponent(prompt.trim());
-  const url = `https://subnp.com/api/v1/generate-image?prompt=${encodedPrompt}&width=1024&height=1024`;
-
-  try {
-    const response = await axios.get(url, { responseType: 'arraybuffer' });
-    if (response.data) {
-      return response.data;
-    } else {
-      throw new Error("No image data received");
-    }
-  } catch (error) {
-    throw new Error(`Image generation failed: ${error.message}`);
-  }
-}
-
 cmd(
   {
-    pattern: "imagine",
+    pattern: "ai",
     react: "🎨",
-    desc: "Generate AI Image from text prompt",
+    desc: "Generate AI Images from Text Prompts",
     category: "ai",
     filename: __filename,
   },
-  async (robin, mek, m, { from, quoted, body, isCmd, command, args, q, isGroup, sender, reply }) => {
-    if (!q) return reply("Please provide a description for the image you want to generate. 🎨✨");
-
-    await reply("🎨 Generating your AI image... ⏳");
-
+  async (robin, mek, m, { from, q, reply }) => {
     try {
-      const imageData = await fetchAIImage(q);
+      if (!q) return reply("*Provide a description for the image you want to generate.* 🎨");
 
-      const caption = `🎨 AI GENERATED IMAGE 🎨\n\n✨ Prompt: ${q}\n🤖 Powered by: SubNP AI\n⚡ Resolution: 1024x1024`;
+      // Send initial message
+      await reply("🎨 *Generating your AI image...* ⏳\n\n*This may take a few moments.*");
 
+      // Clean and encode the prompt
+      const prompt = encodeURIComponent(q.trim());
+      
+      // Generate image using Pollinations.ai (Free API)
+      const generateImage = async (prompt) => {
+        // Pollinations.ai free endpoint
+        const imageUrl = `https://image.pollinations.ai/prompt/${prompt}?width=1024&height=1024&nologo=true&enhance=true`;
+        
+        // Download the generated image
+        const response = await axios.get(imageUrl, {
+          responseType: "arraybuffer",
+          timeout: 60000, // 60 seconds timeout
+        });
+
+        if (response.status !== 200) {
+          throw new Error("Failed to generate image");
+        }
+
+        return {
+          buffer: response.data,
+          url: imageUrl
+        };
+      };
+
+      // Generate the image
+      const image = await generateImage(prompt);
+
+      // Image info message
+      const desc = `🎨 *PIKO AI IMAGE GENERATOR* 🎨
+
+🖼️ *Prompt* : ${q}
+⚡ *Engine* : Pollinations AI
+🎯 *Resolution* : 1024x1024
+🔗 *Direct Link* : ${image.url}
+
+𝐌𝐚𝐝𝐞 𝐛𝐲 *P_I_K_O* ☯️`;
+
+      // Send the generated image
       await robin.sendMessage(
         from,
-        { image: imageData, caption: caption },
+        {
+          image: image.buffer,
+          caption: desc,
+        },
         { quoted: mek }
       );
 
-      reply("Your AI image has been generated successfully! 🎨💜");
-    } catch (error) {
-      console.error("AI Image Generation Error:", error);
-      reply(`❌ Error generating image: ${error.message}`);
+      // Send as document for download
+      await robin.sendMessage(
+        from,
+        {
+          document: image.buffer,
+          mimetype: "image/png",
+          fileName: `AI_Generated_${Date.now()}.png`,
+          caption: `📂 *AI Generated Image* (Document)\n\n*Prompt:* ${q}\n\n𝐌𝐚𝐝𝐞 𝐛𝐲 *P_I_K_O* ☯️`,
+        },
+        { quoted: mek }
+      );
+
+      reply("*Your AI masterpiece is ready!* 🎨✨");
+
+    } catch (e) {
+      console.error("AI Image Generation Error:", e);
+      
+      // Handle specific error cases
+      if (e.code === 'ECONNABORTED' || e.message.includes('timeout')) {
+        reply("⏰ *Request timed out.* The AI service might be busy. Please try again in a moment.");
+      } else if (e.response && e.response.status === 429) {
+        reply("🚫 *Rate limit reached.* Please wait a moment before generating another image.");
+      } else {
+        reply(`❌ *Error generating image:* ${e.message}\n\nPlease try with a different prompt or try again later.`);
+      }
     }
   }
 );
