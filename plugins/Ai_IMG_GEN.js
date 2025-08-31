@@ -3,7 +3,7 @@ const axios = require("axios");
 
 cmd(
   {
-    pattern: "ai",
+    pattern: "imagine",
     react: "🎨",
     desc: "Generate AI Images from Text Prompts",
     category: "ai",
@@ -59,18 +59,6 @@ cmd(
         {
           image: image.buffer,
           caption: desc,
-        },
-        { quoted: mek }
-      );
-
-      // Send as document for download
-      await robin.sendMessage(
-        from,
-        {
-          document: image.buffer,
-          mimetype: "image/png",
-          fileName: `AI_Generated_${Date.now()}.png`,
-          caption: `📂 *AI Generated Image* (Document)\n\n*Prompt:* ${q}\n\n𝐌𝐚𝐝𝐞 𝐛𝐲 *P_I_K_O* ☯️`,
         },
         { quoted: mek }
       );
