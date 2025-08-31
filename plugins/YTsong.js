@@ -6,7 +6,7 @@ cmd(
   {
     pattern: "song",
     react: "🎵",
-    desc: "Download YouTube Song (Audio)",
+    desc: "Download YouTube Song (Audio + Document)",
     category: "download",
     filename: __filename,
   },
@@ -68,6 +68,8 @@ cmd(
 
       // Download & send audio
       const song = await downloadAudio(url);
+
+      // 🎵 Send as normal WhatsApp audio
       await robin.sendMessage(
         from,
         {
@@ -75,6 +77,18 @@ cmd(
           mimetype: "audio/mpeg",
           fileName: `${song.title}.mp3`,
           caption: `🎵 *${song.title}*\n\n𝐌𝐚𝐝𝐞 𝐛𝐲 *P_I_K_O* ☯️`,
+        },
+        { quoted: mek }
+      );
+
+      // 📂 Send again as document
+      await robin.sendMessage(
+        from,
+        {
+          document: song.buffer,
+          mimetype: "audio/mpeg",
+          fileName: `${song.title}.mp3`,
+          caption: `📂 *${song.title}* (Document)\n\n𝐌𝐚𝐝𝐞 𝐛𝐲 *P_I_K_O* ☯️`,
         },
         { quoted: mek }
       );
