@@ -209,11 +209,7 @@ async function sendSubMenu(robin, from, categoryNumber, mek, reply, senderNumber
       commands: [
         { name: "ai", use: ".ai < text >" },
         { name: "gemini", use: ".gemini < text >" },
-        { name: "imagine", use: ".imagine < text >" },
-        { name: "aivideoframes", use: ".aivideoframes < text >" },
-        { name: "aislideshow", use: ".aislideshow < text >" },
-        { name: "vidpreview", use: ".vidpreview < text >" },
-        { name: "aigifframes", use: ".aigifframes < text >" }
+        { name: "imagine", use: ".imagine < text >" }
       ]
     },
     6: {
