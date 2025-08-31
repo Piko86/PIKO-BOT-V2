@@ -208,8 +208,7 @@ async function sendSubMenu(robin, from, categoryNumber, mek, reply, senderNumber
       image: "https://raw.githubusercontent.com/Manmitha96/BOT-PHOTOS/refs/heads/main/BotMenuPhoto/Al.png",
       commands: [
         { name: "ai", use: ".ai < text >" },
-        { name: "gemini", use: ".gemini < text >" },
-        { name: "imagine", use: ".imagine < text >" }
+        { name: "gemini", use: ".gemini < text >" }
       ]
     },
     6: {
