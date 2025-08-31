@@ -1,100 +1,85 @@
 const { cmd } = require("../command");
 const yts = require("yt-search");
-const { ytmp3 } = require("@vreden/youtube_scraper");
+const axios = require("axios");
 
 cmd(
   {
     pattern: "song",
-    react: "🎶",
-    desc: "Download Song",
+    react: "🎵",
+    desc: "Download YouTube Song (Audio)",
     category: "download",
     filename: __filename,
   },
-  async (
-    robin,
-    mek,
-    m,
-    {
-      from,
-      q,
-      reply,
-    }
-  ) => {
+  async (robin, mek, m, { from, q, reply }) => {
     try {
-      if (!q) return reply("*Please provide a song name or YouTube link* ❤️");
+      if (!q) return reply("*Provide a song name or a YouTube link.* 🎶");
 
-      // Search on YouTube
+      // Search video/song
       const search = await yts(q);
+      if (!search.videos || search.videos.length === 0)
+        return reply("❌ No results found. Try another query.");
+
       const data = search.videos[0];
-      if (!data) return reply("❌ No results found. Try another keyword.");
+      const url = data.url;
 
-      // Validate duration (with guard)
-      let durationSeconds = 0;
-      if (data.timestamp) {
-        let parts = data.timestamp.split(":").map(Number);
-        durationSeconds =
-          parts.length === 3
-            ? parts[0] * 3600 + parts[1] * 60 + parts[2]
-            : parts[0] * 60 + parts[1];
+      // Song info message
+      const desc = `🎶 *PIKO YT SONG DOWNLOADER* 🎶
 
-        if (durationSeconds > 1800) {
-          return reply("⏱️ Audio limit is 30 minutes.");
-        }
-      }
+🎤 *Title* : ${data.title}
+📀 *Duration* : ${data.timestamp}
+👁 *Views* : ${data.views}
+📅 *Uploaded* : ${data.ago}
+📺 *Channel* : ${data.author.name}
+🔗 *Link* : ${data.url}
 
-      // Metadata caption
-      let desc = `
-*❤️💟 PIKO YT SONG DOWNLOADER 💜*
+𝐌𝐚𝐝𝐞 𝐛𝐲 *P_I_K_O* ☯️`;
 
-🎵 *Title* : ${data.title}
-📄 *Description* : ${data.description || "N/A"}
-⏱️ *Duration* : ${data.timestamp || "N/A"}
-📅 *Published* : ${data.ago}
-👁️ *Views* : ${data.views}
-🔗 *Url* : ${data.url}
-
-𝐌𝐚𝐝𝐞 𝐛𝐲 *P_I_K_O*
-`;
-
-      // Send preview thumbnail
       await robin.sendMessage(
         from,
         { image: { url: data.thumbnail }, caption: desc },
         { quoted: mek }
       );
 
-      // Download audio
-      const songData = await ytmp3(data.url, "128");
-      if (!songData?.download?.url) {
-        return reply("❌ Failed to fetch audio download link. Try again.");
-      }
+      // Download function (audio only)
+      const downloadAudio = async (url) => {
+        const apiUrl = `https://p.oceansaver.in/ajax/download.php?format=mp3&url=${encodeURIComponent(
+          url
+        )}&api=${process.env.OCEANSAVER_KEY || "default_key"}`;
 
-      // Safe filename
-      const safeFileName = data.title.replace(/[\/\\?%*:|"<>]/g, "_") + ".mp3";
+        const { data: res } = await axios.get(apiUrl);
+        if (!res || !res.success) throw new Error("Song download API failed.");
 
-      // Send audio
+        const { id, title } = res;
+        const progressUrl = `https://p.oceansaver.in/ajax/progress.php?id=${id}`;
+
+        for (let i = 0; i < 10; i++) {
+          const { data: progress } = await axios.get(progressUrl);
+          if (progress.success && progress.progress === 1000) {
+            const audioBuffer = await axios.get(progress.download_url, {
+              responseType: "arraybuffer",
+            });
+            return { buffer: audioBuffer.data, title };
+          }
+          await new Promise((r) => setTimeout(r, 5000));
+        }
+
+        throw new Error("Audio download timed out. Try again later.");
+      };
+
+      // Download & send audio
+      const song = await downloadAudio(url);
       await robin.sendMessage(
         from,
         {
-          audio: { url: songData.download.url },
+          audio: song.buffer,
           mimetype: "audio/mpeg",
+          fileName: `${song.title}.mp3`,
+          caption: `🎵 *${song.title}*\n\n𝐌𝐚𝐝𝐞 𝐛𝐲 *P_I_K_O* ☯️`,
         },
         { quoted: mek }
       );
 
-      // Send as document (optional)
-      await robin.sendMessage(
-        from,
-        {
-          document: { url: songData.download.url },
-          mimetype: "audio/mpeg",
-          fileName: safeFileName,
-          caption: "𝐌𝐚𝐝𝐞 𝐛𝐲 *P_I_K_O* 💜",
-        },
-        { quoted: mek }
-      );
-
-      return reply("*UPLOAD COMPLETED* ✅");
+      reply("*Enjoy your music!* 🎧💜");
     } catch (e) {
       console.error(e);
       reply(`❌ Error: ${e.message}`);
