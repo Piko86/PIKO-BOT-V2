@@ -1,195 +1,274 @@
 /**
- * plugins/xnxx.js (no child_process)
+ * plugins/pornhub.js
  *
- * .xnxx <query>        -> Search xnxx for videos and return a numbered list (reply-to-list required)
- * (reply to list) 1..6 -> Bot tries to extract the direct video file URL from the xnxx page,
- *                         downloads the file via HTTP (no child_process/yt-dlp), and sends it as document.
+ * Multi-step Pornhub search + download plugin (no child_process)
  *
- * IMPORTANT:
- *  - This version does NOT use child_process or yt-dlp.
- *  - Instead it scrapes the xnxx video page for direct video file URLs and downloads them with axios streams.
- *  - Not all xnxx pages expose a simple MP4 URL (some use HLS .m3u8 or obfuscated players). If extraction fails
- *    the bot will return the page URL and ask the user to download externally.
+ * Usage:
+ *  - .pornhub <query>
+ *      -> bot searches pornhub and sends a numbered list of results (1..N). Reply-to-that-list message with a number to select a video.
+ *  - (reply to list) 1..N
+ *      -> bot extracts available quality URLs for that video and sends a numbered quality list (1..M). Reply-to-that-quality-list with a number to pick quality.
+ *  - (reply to quality list) 1..M
+ *      -> bot downloads the selected quality and sends it as a document (up to PORNHUB_MAX_FILE_MB, default 500 MB).
+ *
+ * Notes & limits:
+ *  - This implementation scrapes pornhub pages and uses heuristics to extract direct MP4 URLs (mediaDefinitions, script JSON, mp4 links).
+ *  - Not every pornhub page exposes simple MP4 URLs. If extraction fails or the URL is HLS (.m3u8), the bot will return the page URL for manual download.
+ *  - No child_process or yt-dlp is used. Download is performed via HTTP stream with an enforced size limit.
+ *  - Default max upload size: 500 MB. Configure via environment variable PORNHUB_MAX_FILE_MB.
  *
  * Dependencies:
- *  npm i axios cheerio uuid fs-extra
+ *  npm i axios cheerio fs-extra uuid
  *
- * Behavior / Limitations:
- *  - Attempts multiple heuristics to find a direct MP4 URL on the video page (video > source, JS patterns, meta tags).
- *  - If found and Content-Length is available and <= XNXX_MAX_FILE_MB (env, default 40 MB), the bot downloads and sends it.
- *  - If Content-Length is missing, the bot streams and enforces the same limit by aborting if exceeded.
- *  - If the found URL is HLS (.m3u8) or otherwise unsupported, the bot will not try to convert and will provide the source page URL instead.
- *  - Sessions expire after 8 minutes.
- *
- * Security & Legal:
- *  - This plugin touches adult content. Use responsibly and ensure your deployment allows such content.
- *  - Scraping site structure can break if xnxx changes their HTML/JS. Heuristics may need updates over time.
+ * Export:
+ *  module.exports = { pornhubSession };
  */
 
 const { cmd } = require("../command");
 const axios = require("axios");
 const cheerio = require("cheerio");
-const { v4: uuidv4 } = require("uuid");
+const fs = require("fs-extra");
 const os = require("os");
 const path = require("path");
-const fs = require("fs-extra");
+const { v4: uuidv4 } = require("uuid");
 
-// In-memory session store (keyed by `${senderNumber}|${chatId}`)
-const xnxxSession = new Map();
+// Sessions keyed per user+chat: `${senderNumber}|${chatId}`
+const pornhubSession = new Map();
 const SESSION_TTL = 8 * 60 * 1000; // 8 minutes
 
-// Auto-cleanup
+// Auto-cleanup sessions
 setInterval(() => {
   const now = Date.now();
-  for (const [key, state] of xnxxSession) {
-    if (!state || !state.timestamp || now - state.timestamp > SESSION_TTL) {
-      xnxxSession.delete(key);
-      console.log(`🧹 Cleaned xnxx session ${key}`);
+  for (const [k, s] of pornhubSession) {
+    if (!s || !s.timestamp || now - s.timestamp > SESSION_TTL) {
+      pornhubSession.delete(k);
+      console.log(`🧹 Cleaned pornhub session ${k}`);
     }
   }
 }, 60 * 1000);
 
-// Helper: build session key per user per chat
-const makeSessionKey = (senderNumber, chatId) => `${senderNumber}|${chatId}`;
-
-// Axios client with UA
+// Axios client
 const axiosClient = axios.create({
   timeout: 20000,
   headers: {
     "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     Accept: "text/html,application/xhtml+xml,application/xml",
   },
   maxRedirects: 5,
 });
 
-// Search xnxx and return top N results (same heuristics as before)
-async function searchXnxx(query, maxResults = 6) {
-  const url = `https://www.xnxx.com/?k=${encodeURIComponent(query)}`;
+// Helper: create session key
+const makeSessionKey = (senderNumber, chatId) => `${senderNumber}|${chatId}`;
+
+// Pornhub search: returns top N results with { title, url, thumb }
+async function searchPornhub(query, maxResults = 6) {
+  const url = `https://www.pornhub.com/video/search?search=${encodeURIComponent(query)}`;
   const res = await axiosClient.get(url);
   const $ = cheerio.load(res.data);
 
   const results = [];
-  $("div.thumb a").each((i, el) => {
-    if (results.length >= maxResults) return false;
-    const href = $(el).attr("href");
-    const title = ($(el).attr("title") || $(el).find("img").attr("alt") || "").trim();
-    const img = $(el).find("img").attr("data-src") || $(el).find("img").attr("src") || null;
 
-    if (href && href.startsWith("/video")) {
-      const fullUrl = "https://www.xnxx.com" + href;
+  // Cards often appear as li.pcVideoListItem or div.search-video-result
+  // We'll search for anchors to /view_video.php?viewkey=...
+  $("a").each((i, el) => {
+    if (results.length >= maxResults) return false;
+    const href = $(el).attr("href") || "";
+    if (!href.includes("/view_video.php?viewkey=") && !href.includes("/video/")) return;
+    let full = href.startsWith("http") ? href : `https://www.pornhub.com${href}`;
+    // title
+    const title = ($(el).attr("title") || $(el).find("img").attr("alt") || $(el).text() || "").trim();
+    // thumb
+    const thumb = $(el).find("img").attr("data-src") || $(el).find("img").attr("src") || null;
+
+    // avoid duplicates
+    if (!results.find((r) => r.url === full)) {
       results.push({
         id: uuidv4(),
         title: title || "Untitled",
-        url: fullUrl,
-        thumb: img,
+        url: full,
+        thumb,
       });
     }
   });
 
-  // Fallback selectors
+  // Fallback: look for .phimage or .js-mxp and anchors inside result containers
   if (results.length === 0) {
-    $("a").each((i, el) => {
+    $("li.pcVideoListItem, div.search-video-result").each((i, el) => {
       if (results.length >= maxResults) return false;
-      const href = $(el).attr("href") || "";
-      if (href.startsWith("/video")) {
-        const title = ($(el).text() || "").trim() || "Untitled";
-        const img = $(el).find("img").attr("data-src") || $(el).find("img").attr("src") || null;
-        results.push({
-          id: uuidv4(),
-          title,
-          url: "https://www.xnxx.com" + href,
-          thumb: img,
-        });
+      const a = $(el).find("a").first();
+      const href = a.attr("href") || "";
+      if (!href) return;
+      const full = href.startsWith("http") ? href : `https://www.pornhub.com${href}`;
+      const title = a.attr("title") || $(el).find(".title").text() || "Untitled";
+      const thumb = $(el).find("img").attr("data-src") || $(el).find("img").attr("src") || null;
+      if (!results.find((r) => r.url === full)) {
+        results.push({ id: uuidv4(), title: title.trim(), url: full, thumb });
       }
     });
   }
 
-  return results;
+  return results.slice(0, maxResults);
 }
 
-// Try to extract a direct video URL from the xnxx video page.
-// Returns the first candidate direct URL (likely mp4) or null.
-async function extractDirectVideoUrl(pageUrl) {
+// Extract direct video URLs and qualities from a pornhub video page
+// Returns array of { quality: '1080p', url: 'https://...mp4' } or null if none found
+async function extractPornhubVideoQualities(pageUrl) {
   try {
-    const res = await axiosClient.get(pageUrl, { headers: { Referer: "https://www.xnxx.com/" } });
+    const res = await axiosClient.get(pageUrl, { headers: { Referer: "https://www.pornhub.com/" } });
     const html = res.data;
     const $ = cheerio.load(html);
 
-    // 1) Look for <video><source src="..."></video>
-    const sourceEl = $("video source[src]").first();
-    if (sourceEl && sourceEl.attr("src")) {
-      const u = sourceEl.attr("src");
-      if (u && /^https?:\/\//i.test(u)) return u;
-    }
-
-    // 2) Look for meta tags (og:video)
-    const ogVideo = $("meta[property='og:video']").attr("content") || $("meta[name='twitter:player']").attr("content");
-    if (ogVideo && /^https?:\/\//i.test(ogVideo)) return ogVideo;
-
-    // 3) Heuristic: search script tags for common patterns
+    // 1) Try to find "mediaDefinitions" JSON variable
+    // Patterns to look for:
+    // - var mediaDefinitions = [...]
+    // - "mediaDefinitions": [...]
+    // - "video_url" or "videoUrl" or "sources": [...]
     const scripts = [];
     $("script").each((i, s) => {
       const txt = $(s).html();
-      if (txt && txt.length < 20000) scripts.push(txt);
+      if (txt && txt.length < 200000) scripts.push(txt);
     });
 
-    // Common patterns seen on video sites:
-    // setVideoUrlHigh('https://...mp4')
-    // setVideoUrlLow('...')
-    // "video_url":"https://....mp4"
-    // file: "https://...mp4"
-    // sources: [{"file":"https://...mp4",...}]
-    const patterns = [
-      /setVideoUrlHigh\(['"](?<u>https?:\/\/[^'"]+)['"]\)/i,
-      /setVideoUrlLow\(['"](?<u>https?:\/\/[^'"]+)['"]\)/i,
-      /"video_url"\s*:\s*"(?<u>https?:\/\/[^"]+)"/i,
-      /file\s*:\s*["'](?<u>https?:\/\/[^"']+)["']/i,
-      /sources\s*:\s*\[.*?\{.*?file\s*:\s*["'](?<u>https?:[^"']+)["'].*?\}.*?\]/is,
-      /"file"\s*:\s*"(?<u>https?:\/\/[^"]+)"/i,
-      /"url"\s*:\s*"(?<u>https?:\/\/[^"]+)"/i,
-    ];
-
-    for (const scriptText of scripts) {
-      for (const pat of patterns) {
-        const m = scriptText.match(pat);
-        if (m && m.groups && m.groups.u) {
-          const found = m.groups.u.replace(/\\\//g, "/");
-          if (found && /^https?:\/\//i.test(found)) return found;
+    // Try to parse JSON arrays from scripts
+    for (const txt of scripts) {
+      // mediaDefinitions variable
+      let m = txt.match(/var\s+mediaDefinitions\s*=\s*(\[[\s\S]*?\]);/i);
+      if (!m) m = txt.match(/"mediaDefinitions"\s*:\s*(\[[\s\S]*?\])/i);
+      if (m && m[1]) {
+        try {
+          const arrText = m[1];
+          const obj = JSON.parse(arrText);
+          if (Array.isArray(obj)) {
+            const mapped = obj
+              .map((d) => {
+                // objects can have keys: quality, videoUrl, url, hdUrl, video_url, file
+                const url = d.videoUrl || d.url || d.file || d.video_url || d.src || d.video;
+                const quality = d.quality || d.label || (d.height ? `${d.height}p` : null);
+                if (url && typeof url === "string") return { quality: quality || "unknown", url: url };
+                return null;
+              })
+              .filter(Boolean);
+            if (mapped.length > 0) return uniqQualities(mapped);
+          }
+        } catch (e) {
+          // ignore parse error
         }
       }
+
+      // look for JSON-like 'mediaDefinitions' somewhere else
+      m = txt.match(/mediaDefinitions\s*:\s*(\[[\s\S]*?\])/i);
+      if (m && m[1]) {
+        try {
+          const arrText = m[1];
+          const obj = JSON.parse(arrText);
+          if (Array.isArray(obj)) {
+            const mapped = obj
+              .map((d) => {
+                const url = d.videoUrl || d.url || d.file || d.video_url || d.src || d.file_url;
+                const quality = d.quality || d.label || (d.height ? `${d.height}p` : null);
+                if (url && typeof url === "string") return { quality: quality || "unknown", url: url };
+                return null;
+              })
+              .filter(Boolean);
+            if (mapped.length > 0) return uniqQualities(mapped);
+          }
+        } catch (e) {}
+      }
+
+      // direct JSON with "qualities" or "sources"
+      m = txt.match(/"qualities"\s*:\s*(\{[\s\S]*?\})/i);
+      if (m && m[1]) {
+        try {
+          const qualitiesObj = JSON.parse(m[1]);
+          // qualitiesObj may be { "360p": "...", "480p": "..." }
+          const mapped = [];
+          for (const [k, v] of Object.entries(qualitiesObj)) {
+            if (typeof v === "string" && v.startsWith("http")) mapped.push({ quality: k, url: v });
+            else if (Array.isArray(v)) {
+              for (const entry of v) if (entry && entry.url) mapped.push({ quality: k, url: entry.url });
+            }
+          }
+          if (mapped.length > 0) return uniqQualities(mapped);
+        } catch (e) {}
+      }
+
+      // match patterns like "video_url":"https://...mp4"
+      let m2 = txt.match(/"video_url"\s*:\s*"(?<u>https?:\/\/[^"]+\.mp4[^"]*)"/i);
+      if (m2 && m2.groups && m2.groups.u) {
+        return [{ quality: "unknown", url: m2.groups.u }];
+      }
+
+      // look for "file":"https://...mp4"
+      m2 = txt.match(/"file"\s*:\s*"(?<u>https?:\/\/[^"]+\.mp4[^"]*)"/i);
+      if (m2 && m2.groups && m2.groups.u) return [{ quality: "unknown", url: m2.groups.u }];
+
+      // generic mp4 url in script
+      m2 = txt.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/i);
+      if (m2) return [{ quality: "unknown", url: m2[0] }];
     }
 
-    // 4) Search the HTML body for direct urls (cheap fallback)
-    const urlMatch = html.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/i);
-    if (urlMatch) return urlMatch[0];
-
-    // 5) Sometimes video is provided in JSON inside a data-setup or data- attribute
-    const dataSetup = $('[data-setup]').attr('data-setup');
-    if (dataSetup) {
-      try {
-        const j = JSON.parse(dataSetup);
-        if (j && typeof j === "object") {
-          // common keys
-          const candidates = [j.file, j.sources?.[0]?.file, j.sources?.[0]?.url, j.url].filter(Boolean);
-          if (candidates.length > 0) return candidates[0];
-        }
-      } catch (e) {}
+    // 2) Try meta tags (og:video)
+    const ogVideo = $("meta[property='og:video']").attr("content") || $("meta[name='twitter:player']").attr("content");
+    if (ogVideo && /^https?:\/\//i.test(ogVideo)) {
+      // ogVideo may be an embed or player, not direct mp4. If it's mp4, return it.
+      if (/\.mp4($|\?)/i.test(ogVideo)) return [{ quality: "unknown", url: ogVideo }];
     }
 
-    // If nothing found, return null
+    // 3) Search HTML for direct mp4 links
+    const htmlMatch = html.match(/https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*/i);
+    if (htmlMatch) return [{ quality: "unknown", url: htmlMatch[0] }];
+
+    // nothing found
     return null;
   } catch (e) {
-    console.warn("extractDirectVideoUrl error:", e?.message || e);
+    console.warn("extractPornhubVideoQualities error:", e?.message || e);
     return null;
   }
 }
 
-// Download a URL to a file path with size limit (MB). Returns path on success or throws.
-async function downloadToFile(url, outPath, maxMb = 40) {
-  // Disallow HLS playlists (.m3u8)
+// Remove duplicates by URL, prefer better quality label if available
+function uniqQualities(list) {
+  const seen = new Map();
+  for (const item of list) {
+    if (!item || !item.url) continue;
+    const key = item.url.split("?")[0];
+    if (!seen.has(key)) {
+      seen.set(key, { quality: item.quality || "unknown", url: item.url });
+    } else {
+      // prefer one with a more descriptive quality label
+      const existing = seen.get(key);
+      if (existing.quality === "unknown" && item.quality && item.quality !== "unknown") {
+        seen.set(key, item);
+      }
+    }
+  }
+  // Sort by quality numeric if possible (1080p > 720p ...)
+  const arr = Array.from(seen.values());
+  arr.sort((a, b) => {
+    const qa = parseInt((a.quality || "").replace("p", ""), 10) || 0;
+    const qb = parseInt((b.quality || "").replace("p", ""), 10) || 0;
+    return qb - qa;
+  });
+  return arr;
+}
+
+// Try to get content-length (MB) via HEAD; returns MB or null if unknown
+async function probeSizeMB(url) {
+  try {
+    const res = await axiosClient.head(url, { maxRedirects: 5, timeout: 15000, headers: { Referer: "https://www.pornhub.com/" } });
+    const cl = res.headers["content-length"];
+    if (cl) return parseInt(cl, 10) / (1024 * 1024);
+  } catch (e) {
+    // HEAD might be blocked; return null
+  }
+  return null;
+}
+
+// Download with streaming and size limit (MB)
+async function downloadToFileWithLimit(url, outPath, maxMb = 500) {
   if (/\.m3u8($|\?)/i.test(url)) {
-    throw new Error("HLS stream detected (.m3u8) — direct download not supported by this plugin.");
+    throw new Error("HLS stream detected (.m3u8) — direct download not supported.");
   }
 
   const writer = fs.createWriteStream(outPath);
@@ -197,41 +276,34 @@ async function downloadToFile(url, outPath, maxMb = 40) {
     url,
     method: "GET",
     responseType: "stream",
-    headers: { Referer: "https://www.xnxx.com/" },
+    headers: { Referer: "https://www.pornhub.com/" },
     timeout: 60000,
     maxContentLength: Infinity,
     maxBodyLength: Infinity,
   });
 
   const contentLength = res.headers["content-length"] ? parseInt(res.headers["content-length"], 10) : null;
-  if (contentLength && contentLength / (1024 * 1024) > maxMb) {
-    // close stream
+  const limitBytes = maxMb * 1024 * 1024;
+  if (contentLength && contentLength > limitBytes) {
     res.data.destroy();
     throw new Error(`Remote file is too large (${Math.round(contentLength / (1024 * 1024))} MB).`);
   }
 
   return new Promise((resolve, reject) => {
     let downloaded = 0;
-    const limitBytes = maxMb * 1024 * 1024;
-
     res.data.on("data", (chunk) => {
       downloaded += chunk.length;
       if (downloaded > limitBytes) {
-        // abort
         res.data.destroy();
         writer.destroy();
-        // remove file
         try { fs.removeSync(outPath); } catch (e) {}
-        reject(new Error(`Download aborted: exceeded ${maxMb} MB limit.`));
-      } else {
-        // continue
+        return reject(new Error(`Download aborted: exceeded ${maxMb} MB limit.`));
       }
     });
 
     res.data.pipe(writer);
 
     writer.on("finish", async () => {
-      // verify size
       try {
         const stat = await fs.stat(outPath);
         if (stat.size > limitBytes) {
@@ -256,59 +328,45 @@ async function downloadToFile(url, outPath, maxMb = 40) {
   });
 }
 
-// Utility to get file size in MB (sync)
-function fileSizeMB(filePath) {
-  try {
-    const stats = fs.statSync(filePath);
-    return stats.size / (1024 * 1024);
-  } catch (e) {
-    return Infinity;
-  }
-}
-
-// Main command: .xnxx <query>
+// Main command: .pornhub <query>
 cmd(
   {
-    pattern: "xnxx",
+    pattern: "pornhub",
     react: "🔞",
-    desc: "Search xnxx and download a chosen video (attempts direct download without child_process)",
+    desc: "Search pornhub and download a chosen video (multi-step: choose video -> choose quality)",
     category: "download",
     filename: __filename,
   },
   async (robin, mek, m, { from, q, reply, senderNumber }) => {
     try {
-      if (!q) return reply("*Provide a search term.* Example: .xnxx big tits");
+      if (!q) return reply("*Provide a search term.* Example: .pornhub big tits");
 
-      await robin.sendMessage(from, { text: `🔎 Searching xnxx for: ${q}\nPlease wait...` }, { quoted: mek });
+      await robin.sendMessage(from, { text: `🔎 Searching Pornhub for: ${q}\nPlease wait...` }, { quoted: mek });
 
-      const results = await searchXnxx(q, 6);
-      if (!results || results.length === 0) return reply("❌ No results found on xnxx for that query.");
+      const results = await searchPornhub(q, 8);
+      if (!results || results.length === 0) return reply("❌ No results found on Pornhub for that query.");
 
-      // Save session
       const sessionKey = makeSessionKey(senderNumber, from);
-      xnxxSession.set(sessionKey, {
+      pornhubSession.set(sessionKey, {
+        stage: "choose_video",
         timestamp: Date.now(),
         results,
         messageId: null,
       });
 
-      // Build numbered list caption
-      let listText = `🔞 Search results for: ${q}\nReply to this message with the number of the video to download (1-${results.length}).\n\n`;
+      // Build list caption
+      let listText = `🔞 Pornhub results for: ${q}\nReply to this message with the number of the video to inspect/download (1-${results.length}).\n\n`;
       results.forEach((r, i) => {
         listText += `*${i + 1}.* ${r.title}\n${r.url}\n\n`;
       });
-      listText += "⛔ Use responsibly. Downloads may be large and may fail if the site hides video URLs.";
+      listText += `⛔ Use responsibly. After selecting a video you'll be asked to pick a quality.`;
 
-      // Send thumbnail of first result + caption list
+      // Send thumbnail and caption
       const firstThumb = results[0].thumb;
       let sent;
       try {
         if (firstThumb && /^https?:\/\//i.test(firstThumb)) {
-          sent = await robin.sendMessage(
-            from,
-            { image: { url: firstThumb }, caption: listText },
-            { quoted: mek }
-          );
+          sent = await robin.sendMessage(from, { image: { url: firstThumb }, caption: listText }, { quoted: mek });
         } else {
           sent = await robin.sendMessage(from, { text: listText }, { quoted: mek });
         }
@@ -316,26 +374,21 @@ cmd(
         sent = await robin.sendMessage(from, { text: listText }, { quoted: mek });
       }
 
-      // store message id for reply-checks
-      try {
-        const msgId = sent?.key?.id || sent?.id || null;
-        const s = xnxxSession.get(sessionKey);
-        if (s) {
-          s.messageId = msgId;
-          s.timestamp = Date.now();
-          xnxxSession.set(sessionKey, s);
-        }
-      } catch (e) {
-        // ignore
+      const msgId = sent?.key?.id || sent?.id || null;
+      const s = pornhubSession.get(sessionKey);
+      if (s) {
+        s.messageId = msgId;
+        s.timestamp = Date.now();
+        pornhubSession.set(sessionKey, s);
       }
     } catch (e) {
-      console.error("xnxx search error:", e);
-      reply(`❌ Error searching xnxx: ${e.message || "Unknown error"}`);
+      console.error("pornhub search error:", e);
+      reply(`❌ Error searching Pornhub: ${e.message || "Unknown error"}`);
     }
   }
 );
 
-// Reply handler - user replies with number to download
+// Reply handler: handles both video selection and quality selection
 cmd(
   {
     on: "body",
@@ -344,10 +397,10 @@ cmd(
   async (robin, mek, m, { from, senderNumber, body, quoted, reply }) => {
     try {
       const sessionKey = makeSessionKey(senderNumber, from);
-      const session = xnxxSession.get(sessionKey);
-      if (!session || !session.results || session.results.length === 0) return;
+      const session = pornhubSession.get(sessionKey);
+      if (!session) return;
 
-      // Only accept replies to the original session message
+      // must be a reply
       if (!quoted) return;
       const quotedId =
         quoted?.key?.id ||
@@ -356,91 +409,174 @@ cmd(
         quoted?.message?.extendedTextMessage?.contextInfo?.id ||
         null;
       if (!quotedId) return;
-      if (session.messageId && quotedId !== session.messageId) return;
+
+      if (session.messageId && quotedId !== session.messageId) {
+        // Not replying to our session message
+        return;
+      }
 
       // parse number
       const selected = parseInt((body || "").trim(), 10);
-      if (isNaN(selected) || selected < 1 || selected > session.results.length) {
-        return reply(`❌ Please reply with a valid number (1-${session.results.length}).`);
-      }
+      if (isNaN(selected)) return;
 
-      const item = session.results[selected - 1];
-      if (!item) return reply("❌ Selected item not found (expired?). Try .xnxx again.");
+      // Stage: choose_video
+      if (session.stage === "choose_video") {
+        if (selected < 1 || selected > session.results.length) {
+          return reply(`❌ Please reply with a valid number (1-${session.results.length}).`);
+        }
 
-      // Update timestamp
-      session.timestamp = Date.now();
-      xnxxSession.set(sessionKey, session);
+        const item = session.results[selected - 1];
+        if (!item) return reply("❌ Item not found (maybe expired). Try .pornhub again.");
 
-      await robin.sendMessage(from, { text: `⏬ Attempting to extract and download: ${item.title}\nThis may take a while.` }, { quoted: mek });
+        // move to next stage
+        session.stage = "choose_quality";
+        session.selectedIndex = selected - 1;
+        session.qualities = null;
+        session.timestamp = Date.now();
+        pornhubSession.set(sessionKey, session);
 
-      // Try to extract direct video URL
-      const directUrl = await extractDirectVideoUrl(item.url);
-      if (!directUrl) {
-        // couldn't extract: return the page URL to user
-        return reply(`❌ Couldn't extract a direct video URL for that item. Please open in your browser:\n${item.url}`);
-      }
+        await robin.sendMessage(from, { text: `🔎 Extracting available qualities for:\n${item.title}\n${item.url}\nPlease wait...` }, { quoted: mek });
 
-      // If url is HLS (.m3u8) or not mp4, don't attempt raw download
-      if (/\.m3u8($|\?)/i.test(directUrl) || !/\.mp4($|\?)/i.test(directUrl)) {
-        return reply(`⚠️ Extracted video URL is a stream or not a direct MP4, download via yt-dlp or a player:\n${directUrl}\n(Automatic download not supported for HLS/stream URLs).`);
-      }
+        // extract qualities
+        const qualities = await extractPornhubVideoQualities(item.url);
+        if (!qualities || qualities.length === 0) {
+          // cannot extract
+          session.stage = "finished";
+          pornhubSession.set(sessionKey, session);
+          return reply(`❌ Couldn't extract direct video URLs for that video. Open in your browser:\n${item.url}`);
+        }
 
-      // Prepare tmp dir and download
-      const tmpDir = path.join(os.tmpdir(), "piko_xnxx");
-      if (!(await fs.pathExists(tmpDir))) await fs.ensureDir(tmpDir);
-
-      const uid = uuidv4();
-      const ext = path.extname(new URL(directUrl).pathname).split("?")[0] || ".mp4";
-      const outPath = path.join(tmpDir, `${uid}${ext}`);
-
-      const MAX_FILE_MB = parseFloat(process.env.XNXX_MAX_FILE_MB || "40");
-
-      let downloadedFile;
-      try {
-        downloadedFile = await downloadToFile(directUrl, outPath, MAX_FILE_MB);
-      } catch (e) {
-        console.error("downloadToFile error:", e);
-        // If download aborted due to size or other error, inform user and provide direct link
-        return reply(`❌ Failed to download the extracted video: ${e.message || "download error"}\nYou can try the direct link:\n${directUrl}`);
-      }
-
-      if (!downloadedFile || !(await fs.pathExists(downloadedFile))) {
-        return reply("❌ Download finished but file not found.");
-      }
-
-      const sizeMb = fileSizeMB(downloadedFile);
-      if (sizeMb > MAX_FILE_MB) {
-        // Too big, send direct URL instead
-        try { await fs.remove(downloadedFile); } catch (e) {}
-        return reply(`⚠️ Downloaded file is ${Math.round(sizeMb)} MB which exceeds the limit of ${MAX_FILE_MB} MB.\nYou can download directly: ${directUrl}`);
-      }
-
-      // Read file buffer and send as document
-      const buffer = await fs.readFile(downloadedFile);
-      const safeName = path.basename(downloadedFile).replace(/[^\w.\-() ]+/g, "");
-      try {
-        await robin.sendMessage(
-          from,
-          {
-            document: buffer,
-            mimetype: "video/mp4",
-            fileName: safeName,
-            caption: `🎬 ${item.title}`,
-          },
-          { quoted: mek }
+        // probe sizes (optional) and attach size info
+        const maxProbe = Math.min(qualities.length, 6);
+        const qWithSize = await Promise.all(
+          qualities.map(async (qItem) => {
+            let sizeMb = await probeSizeMB(qItem.url);
+            if (sizeMb === null) sizeMb = null;
+            return { quality: qItem.quality || "unknown", url: qItem.url, sizeMb };
+          })
         );
-      } catch (e) {
-        console.error("Send file error:", e);
-        // fallback: send direct link
-        await robin.sendMessage(from, { text: `❌ Sending file failed. You can download directly: ${directUrl}` }, { quoted: mek });
-      } finally {
-        // cleanup
-        try { await fs.remove(downloadedFile); } catch (e) {}
+
+        session.qualities = qWithSize;
+        session.timestamp = Date.now();
+        pornhubSession.set(sessionKey, session);
+
+        // Build quality list text
+        let qText = `🎚️ Available qualities for: ${item.title}\nReply to this message with the number to choose (1-${qWithSize.length}).\n\n`;
+        qWithSize.forEach((qI, idx) => {
+          qText += `*${idx + 1}.* ${qI.quality} ${qI.sizeMb ? `- ${Math.round(qI.sizeMb)} MB` : ""}\n${qI.url}\n\n`;
+        });
+        qText += `\nMax upload limit: ${process.env.PORNHUB_MAX_FILE_MB || 500} MB. If the file is larger you'll receive the direct link instead.`;
+
+        const firstThumb = item.thumb;
+        let sent;
+        try {
+          if (firstThumb && /^https?:\/\//i.test(firstThumb)) {
+            sent = await robin.sendMessage(from, { image: { url: firstThumb }, caption: qText }, { quoted: mek });
+          } else {
+            sent = await robin.sendMessage(from, { text: qText }, { quoted: mek });
+          }
+        } catch (e) {
+          sent = await robin.sendMessage(from, { text: qText }, { quoted: mek });
+        }
+
+        // update messageId to the new message so next reply must reference it
+        try {
+          const msgId = sent?.key?.id || sent?.id || null;
+          session.messageId = msgId;
+          session.timestamp = Date.now();
+          pornhubSession.set(sessionKey, session);
+        } catch (e) {}
+        return;
+      }
+
+      // Stage: choose_quality
+      if (session.stage === "choose_quality") {
+        const qualities = session.qualities || [];
+        if (selected < 1 || selected > qualities.length) {
+          return reply(`❌ Please reply with a valid number (1-${qualities.length}).`);
+        }
+
+        const qItem = qualities[selected - 1];
+        if (!qItem) return reply("❌ Selected quality not found. Try again.");
+
+        // ready to download
+        session.stage = "downloading";
+        session.timestamp = Date.now();
+        pornhubSession.set(sessionKey, session);
+
+        const item = session.results[session.selectedIndex];
+
+        await robin.sendMessage(from, { text: `⏬ Downloading (${qItem.quality}) for:\n${item.title}\nPlease wait...` }, { quoted: mek });
+
+        // Prepare tmp dir
+        const tmpDir = path.join(os.tmpdir(), "piko_pornhub");
+        if (!(await fs.pathExists(tmpDir))) await fs.ensureDir(tmpDir);
+
+        const uid = uuidv4();
+        // Try to derive extension from URL
+        let ext = ".mp4";
+        try {
+          const parsed = new URL(qItem.url);
+          ext = path.extname(parsed.pathname).split("?")[0] || ".mp4";
+        } catch (e) {}
+
+        const outPath = path.join(tmpDir, `${uid}${ext}`);
+
+        // Max file size (MB) default 500
+        const MAX_FILE_MB = parseFloat(process.env.PORNHUB_MAX_FILE_MB || "500");
+
+        // First probe
+        const probed = await probeSizeMB(qItem.url);
+        if (probed && probed > MAX_FILE_MB) {
+          // too big, return direct URL
+          return reply(`⚠️ Selected quality appears to be ${Math.round(probed)} MB which exceeds the limit of ${MAX_FILE_MB} MB.\nDirect link:\n${qItem.url}`);
+        }
+
+        // Download with streaming & limit
+        let downloadedFile;
+        try {
+          downloadedFile = await downloadToFileWithLimit(qItem.url, outPath, MAX_FILE_MB);
+        } catch (e) {
+          console.error("pornhub download error:", e);
+          // give direct link as fallback
+          try { await fs.remove(outPath); } catch (err) {}
+          return reply(`❌ Failed to download video: ${e.message || "download error"}\nDirect link:\n${qItem.url}`);
+        }
+
+        if (!downloadedFile || !(await fs.pathExists(downloadedFile))) {
+          return reply("❌ Download finished but file not found.");
+        }
+
+        // Send file as document
+        const buffer = await fs.readFile(downloadedFile);
+        const safeName = `${item.title.replace(/[^\w\s.\-()]/g, "").slice(0, 60)}-${qItem.quality}${ext}`;
+        try {
+          await robin.sendMessage(
+            from,
+            {
+              document: buffer,
+              mimetype: "video/mp4",
+              fileName: safeName,
+              caption: `🎬 ${item.title} — ${qItem.quality}`,
+            },
+            { quoted: mek }
+          );
+        } catch (e) {
+          console.error("pornhub send error:", e);
+          // fallback: send direct link
+          await robin.sendMessage(from, { text: `❌ Sending file failed. You can download directly: ${qItem.url}` }, { quoted: mek });
+        } finally {
+          try { await fs.remove(downloadedFile); } catch (e) {}
+        }
+
+        // mark session finished
+        pornhubSession.delete(sessionKey);
+        return;
       }
     } catch (e) {
-      console.error("xnxx reply handler error:", e);
+      console.error("pornhub handler error:", e);
     }
   }
 );
 
-module.exports = { xnxxSession };
+module.exports = { pornhubSession };
