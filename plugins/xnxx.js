@@ -1,25 +1,22 @@
 /**
  * plugins/pornhub.js
  *
- * Updated: Multi-step Pornhub search + direct-download plugin
- * - Search returns a larger result set (default 20, up to 25).
- * - Removed manual quality-selection step: bot auto-selects 480p (fallback to closest available).
- * - Supports direct use: .pornhub <pornhub_video_url> -> directly extract + download (uses 480p default).
- * - Increased default upload limit to 500 MB (env PORNHUB_MAX_FILE_MB).
- * - Optimizations: reduced script scanning length, probe sizes only when useful, single-step download once item selected.
+ * Fix: handle cases where extracted URL points to a short preview clip (10s) by probing and
+ * trying alternate candidates. Automatically prefers 480p but will skip preview-size files
+ * (default threshold PORNHUB_MIN_ACCEPT_MB = 5 MB) and will fall back to the largest candidate.
  *
- * Usage:
- *  - .pornhub <query>
- *      -> bot searches pornhub and sends a numbered list of results (1..N up to 25). Reply to that list with a number to download.
- *  - .pornhub <pornhub_video_url>
- *      -> bot will extract and attempt to download the 480p version immediately.
+ * Behavior changes:
+ * - When multiple candidate URLs are found, the plugin probes Content-Length for each and
+ *   prefers a candidate whose size is above PORNHUB_MIN_ACCEPT_MB (default 5 MB) and within
+ *   the configured max (PORNHUB_MAX_FILE_MB, default 500).
+ * - If HEAD is unavailable, it will attempt download and reject small files (below threshold),
+ *   trying the next candidate.
+ * - This prevents selecting tiny preview clips (10s) and should return the full-length video.
+ *
+ * Usage remains the same.
  *
  * Dependencies:
  *  npm i axios cheerio fs-extra uuid
- *
- * Note:
- *  - Some pages serve HLS (.m3u8) or obfuscated players; in such cases the plugin will provide a direct page/stream link instead of downloading.
- *  - Respect site terms and legal restrictions for adult content and distribution.
  */
 
 const { cmd } = require("../command");
@@ -58,6 +55,10 @@ const axiosClient = axios.create({
 
 // Helper: create session key
 const makeSessionKey = (senderNumber, chatId) => `${senderNumber}|${chatId}`;
+
+// Configurable thresholds via env
+const PORNHUB_MAX_FILE_MB = parseFloat(process.env.PORNHUB_MAX_FILE_MB || "500");
+const PORNHUB_MIN_ACCEPT_MB = parseFloat(process.env.PORNHUB_MIN_ACCEPT_MB || "5"); // avoid previews below ~5MB
 
 // Search Pornhub: returns up to maxResults (default 20, max 25)
 async function searchPornhub(query, maxResults = 20) {
@@ -247,7 +248,7 @@ async function probeSizeMB(url) {
 }
 
 // Download streaming with size limit (MB)
-async function downloadToFileWithLimit(url, outPath, maxMb = 500) {
+async function downloadToFileWithLimit(url, outPath, maxMb = PORNHUB_MAX_FILE_MB) {
   if (/\.m3u8($|\?)/i.test(url)) throw new Error("HLS stream detected (.m3u8) — direct download not supported.");
   const writer = fs.createWriteStream(outPath);
   const res = await axios.request({
@@ -306,6 +307,87 @@ async function downloadToFileWithLimit(url, outPath, maxMb = 500) {
   });
 }
 
+// Helper: attempt multiple candidates, prefer > MIN_ACCEPT_MB and <= MAX_FILE_MB.
+// Returns path to downloaded file or throws.
+async function downloadWithCandidates(qualities, preferred, outPathBase, maxMb = PORNHUB_MAX_FILE_MB) {
+  if (!qualities || qualities.length === 0) throw new Error("No candidates provided.");
+
+  // Order candidates: prefer preferred quality first, then by numeric quality desc
+  const preferredIndex = qualities.findIndex((q) => String(q.quality).toLowerCase().includes(String(preferred).toLowerCase()));
+  const ordered = [...qualities];
+
+  if (preferredIndex > -1) {
+    const [p] = ordered.splice(preferredIndex, 1);
+    ordered.unshift(p);
+  }
+
+  ordered.sort((a, b) => {
+    const qa = parseInt((a.quality || "").replace(/[^0-9]/g, ""), 10) || 0;
+    const qb = parseInt((b.quality || "").replace(/[^0-9]/g, ""), 10) || 0;
+    return qb - qa;
+  });
+
+  // Try to probe content-length for candidates and pick those above MIN_ACCEPT if possible
+  const candidates = [];
+  for (const q of ordered) {
+    const sizeMb = await probeSizeMB(q.url).catch(() => null);
+    candidates.push({ ...q, sizeMb });
+  }
+
+  // Prefer candidates with sizeMb >= PORNHUB_MIN_ACCEPT_MB and <= maxMb
+  const acceptable = candidates.filter((c) => c.sizeMb && c.sizeMb >= PORNHUB_MIN_ACCEPT_MB && c.sizeMb <= maxMb);
+  const fallbackCandidates = candidates.filter((c) => !c.sizeMb || (c.sizeMb > 0 && c.sizeMb <= maxMb)); // unknown sizes allowed
+
+  const tryList = acceptable.length ? acceptable.concat(fallbackCandidates.filter((c) => !acceptable.includes(c))) : fallbackCandidates;
+
+  // As ultimate fallback, include original order
+  if (tryList.length === 0) {
+    tryList.push(...ordered);
+  }
+
+  // Now attempt downloads sequentially until one produces a file >= MIN_ACCEPT_MB
+  for (let i = 0; i < tryList.length; i++) {
+    const cand = tryList[i];
+    try {
+      const uid = uuidv4();
+      let ext = ".mp4";
+      try { ext = path.extname(new URL(cand.url).pathname).split("?")[0] || ".mp4"; } catch (e) {}
+      const outPath = `${outPathBase}-${uid}${ext}`;
+
+      // If candidate probed and is larger than maxMb, skip
+      if (cand.sizeMb && cand.sizeMb > maxMb) {
+        continue;
+      }
+
+      // If probed and below MIN_ACCEPT_MB, skip (likely preview)
+      if (cand.sizeMb && cand.sizeMb < PORNHUB_MIN_ACCEPT_MB) {
+        continue;
+      }
+
+      // Attempt download; if HEAD unavailable it may download a small preview and we'll detect and retry
+      await downloadToFileWithLimit(cand.url, outPath, maxMb);
+
+      // verify downloaded size
+      const stat = await fs.stat(outPath);
+      const sizeMb = stat.size / (1024 * 1024);
+      if (sizeMb < PORNHUB_MIN_ACCEPT_MB) {
+        // too small (preview), delete and continue
+        try { await fs.remove(outPath); } catch (e) {}
+        continue;
+      }
+
+      // success
+      return { path: outPath, candidate: cand };
+    } catch (e) {
+      // log and continue to next candidate
+      console.warn("downloadWithCandidates candidate failed, trying next:", cand?.url, e?.message || e);
+      continue;
+    }
+  }
+
+  throw new Error("All candidate downloads failed or produced only preview clips.");
+}
+
 // Utility to get file size in MB (sync)
 function fileSizeMB(filePath) {
   try {
@@ -341,45 +423,33 @@ cmd(
           return reply(`❌ Couldn't extract direct video URLs. Open page in browser:\n${arg}`);
         }
 
-        // pick 480p preferred
-        const chosen = pickPreferredQuality(qualities, "480p") || qualities[0];
+        // prepare ordered candidate set and download with fallback
+        await robin.sendMessage(from, { text: `🔎 Found ${qualities.length} candidate URL(s). Probing and selecting best one...` }, { quoted: mek });
 
-        // probe and download
-        const MAX_FILE_MB = parseFloat(process.env.PORNHUB_MAX_FILE_MB || "500");
-        const probed = await probeSizeMB(chosen.url);
-        if (probed && probed > MAX_FILE_MB) {
-          return reply(`⚠️ The selected file is ${Math.round(probed)} MB which exceeds the configured limit of ${MAX_FILE_MB} MB.\nDirect link:\n${chosen.url}`);
-        }
-
-        await robin.sendMessage(from, { text: `⏬ Downloading (auto: ${chosen.quality || "unknown"})\n${chosen.url}\nThis may take a while...` }, { quoted: mek });
-
-        const tmpDir = path.join(os.tmpdir(), "piko_pornhub");
-        if (!(await fs.pathExists(tmpDir))) await fs.ensureDir(tmpDir);
-        const uid = uuidv4();
-        let ext = ".mp4";
-        try { ext = path.extname(new URL(chosen.url).pathname).split("?")[0] || ".mp4"; } catch (e) {}
-        const outPath = path.join(tmpDir, `${uid}${ext}`);
-
-        let downloadedFile;
+        let result;
         try {
-          downloadedFile = await downloadToFileWithLimit(chosen.url, outPath, MAX_FILE_MB);
+          const tmpDir = path.join(os.tmpdir(), "piko_pornhub");
+          if (!(await fs.pathExists(tmpDir))) await fs.ensureDir(tmpDir);
+          const outPathBase = path.join(tmpDir, "pornhub");
+          result = await downloadWithCandidates(qualities, "480p", outPathBase, PORNHUB_MAX_FILE_MB);
         } catch (e) {
-          console.error("download error:", e);
-          try { await fs.remove(outPath); } catch (err) {}
-          return reply(`❌ Failed to download: ${e.message || "download error"}\nDirect link:\n${chosen.url}`);
+          console.error("direct URL download failed:", e);
+          return reply(`❌ Failed to download full video (extraction or candidates issue): ${e.message || e}\nYou can try the page manually: ${arg}`);
         }
 
+        const { path: downloadedFile, candidate } = result;
         const buffer = await fs.readFile(downloadedFile);
-        const safeName = `pornhub-${uid}-${(chosen.quality || "unknown")}${ext}`;
+        const safeTitle = (candidate?.quality || "pornhub").replace(/[^\w\s.\-()]/g, "").slice(0, 60);
+        const safeName = `${safeTitle}-${(candidate.quality || "unknown")}${path.extname(downloadedFile)}`;
         try {
           await robin.sendMessage(
             from,
-            { document: buffer, mimetype: "video/mp4", fileName: safeName, caption: `🎬 Download — ${chosen.quality || "unknown"}` },
+            { document: buffer, mimetype: "video/mp4", fileName: safeName, caption: `🎬 Download — ${candidate.quality || "unknown"}` },
             { quoted: mek }
           );
         } catch (e) {
           console.error("send error:", e);
-          await robin.sendMessage(from, { text: `❌ Sending file failed. Direct link: ${chosen.url}` }, { quoted: mek });
+          await robin.sendMessage(from, { text: `❌ Sending file failed. Direct link: ${candidate.url}` }, { quoted: mek });
         } finally {
           try { await fs.remove(downloadedFile); } catch (e) {}
         }
@@ -406,7 +476,7 @@ cmd(
       results.forEach((r, i) => {
         listText += `*${i + 1}.* ${r.title}\n${r.url}\n\n`;
       });
-      listText += `⛔ Use responsibly. The bot will auto-select 480p or closest available. Max upload: ${process.env.PORNHUB_MAX_FILE_MB || 500} MB`;
+      listText += `⛔ Use responsibly. The bot will auto-select 480p or closest available and will skip preview clips. Max upload: ${PORNHUB_MAX_FILE_MB} MB`;
 
       // Send thumbnail of first result + caption (so user can reply to it)
       const firstThumb = results[0].thumb;
@@ -478,46 +548,23 @@ cmd(
         return reply(`❌ Couldn't extract direct video URLs for that video. Open in your browser:\n${item.url}`);
       }
 
-      const chosen = pickPreferredQuality(qualities, "480p") || qualities[0];
-
-      const MAX_FILE_MB = parseFloat(process.env.PORNHUB_MAX_FILE_MB || "500");
-      const probed = await probeSizeMB(chosen.url);
-      if (probed && probed > MAX_FILE_MB) {
-        pornhubSession.delete(sessionKey);
-        return reply(`⚠️ The selected file is ${Math.round(probed)} MB which exceeds the configured limit of ${MAX_FILE_MB} MB.\nDirect link:\n${chosen.url}`);
-      }
-
-      await robin.sendMessage(from, { text: `⏬ Downloading (auto: ${chosen.quality || "unknown"})\nThis may take a while...` }, { quoted: mek });
-
-      // Prepare tmp dir
-      const tmpDir = path.join(os.tmpdir(), "piko_pornhub");
-      if (!(await fs.pathExists(tmpDir))) await fs.ensureDir(tmpDir);
-
-      const uid = uuidv4();
-      let ext = ".mp4";
-      try { ext = path.extname(new URL(chosen.url).pathname).split("?")[0] || ".mp4"; } catch (e) {}
-      const outPath = path.join(tmpDir, `${uid}${ext}`);
-
-      let downloadedFile;
+      // Try to download using candidate logic
+      let result;
       try {
-        downloadedFile = await downloadToFileWithLimit(chosen.url, outPath, MAX_FILE_MB);
+        const tmpDir = path.join(os.tmpdir(), "piko_pornhub");
+        if (!(await fs.pathExists(tmpDir))) await fs.ensureDir(tmpDir);
+        const outPathBase = path.join(tmpDir, "pornhub");
+        result = await downloadWithCandidates(qualities, "480p", outPathBase, PORNHUB_MAX_FILE_MB);
       } catch (e) {
-        console.error("downloadToFileWithLimit error:", e);
-        try { await fs.remove(outPath); } catch (err) {}
+        console.error("downloadWithCandidates error:", e);
         pornhubSession.delete(sessionKey);
-        return reply(`❌ Failed to download video: ${e.message || "download error"}\nDirect link:\n${chosen.url}`);
+        return reply(`❌ Failed to download full video (candidates/extraction issue): ${e.message || e}\nDirect page: ${item.url}`);
       }
 
-      if (!downloadedFile || !(await fs.pathExists(downloadedFile))) {
-        pornhubSession.delete(sessionKey);
-        return reply("❌ Download finished but file not found.");
-      }
-
-      // Send file as document
+      const { path: downloadedFile, candidate } = result;
       const buffer = await fs.readFile(downloadedFile);
-      // FIX: escape '-' inside character class by placing it last or escaping it. using safe regex below
       const safeTitle = (item.title || "pornhub").replace(/[^\w\s.\-()]/g, "").slice(0, 60);
-      const safeName = `${safeTitle}-${(chosen.quality || "unknown")}${ext}`;
+      const safeName = `${safeTitle}-${(candidate.quality || "unknown")}${path.extname(downloadedFile)}`;
       try {
         await robin.sendMessage(
           from,
@@ -525,13 +572,13 @@ cmd(
             document: buffer,
             mimetype: "video/mp4",
             fileName: safeName,
-            caption: `🎬 ${item.title} — ${chosen.quality || "unknown"}`,
+            caption: `🎬 ${item.title} — ${candidate.quality || "unknown"}`,
           },
           { quoted: mek }
         );
       } catch (e) {
         console.error("send error:", e);
-        await robin.sendMessage(from, { text: `❌ Sending file failed. Direct link: ${chosen.url}` }, { quoted: mek });
+        await robin.sendMessage(from, { text: `❌ Sending file failed. Direct link: ${candidate.url}` }, { quoted: mek });
       } finally {
         try { await fs.remove(downloadedFile); } catch (e) {}
         pornhubSession.delete(sessionKey);
