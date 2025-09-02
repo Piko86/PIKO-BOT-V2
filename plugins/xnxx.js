@@ -92,14 +92,14 @@ async function searchPornhub(query, maxResults = 20) {
   if (results.length < Math.min(6, maxResults)) {
     $("li.pcVideoListItem, div.search-video-result, div.videoBox").each((i, el) => {
       if (results.length >= maxResults) return false;
-      const a = cheerio(el).find("a").first();
+      const a = $(el).find("a").first();
       const href = a.attr("href") || "";
       if (!href) return;
       const full = href.startsWith("http") ? href : `https://www.pornhub.com${href}`;
-      const title = a.attr("title") || cheerio(el).find(".title").text() || "Untitled";
-      const thumb = cheerio(el).find("img").attr("data-src") || cheerio(el).find("img").attr("src") || null;
+      const title = a.attr("title") || $(el).find(".title").text() || "Untitled";
+      const thumb = $(el).find("img").attr("data-src") || $(el).find("img").attr("src") || null;
       if (!results.find((r) => r.url === full)) {
-        results.push({ id: uuidv4(), title: title.trim() || "Untitled", url: full, thumb });
+        results.push({ id: uuidv4(), title: (title || "Untitled").trim(), url: full, thumb });
       }
     });
   }
@@ -219,7 +219,7 @@ function pickPreferredQuality(qualities, preferred = "480p") {
   // try exact match
   const exact = qualities.find((q) => String(q.quality).toLowerCase().includes(String(preferred).toLowerCase()));
   if (exact) return exact;
-  // try numeric closests: compute difference
+  // try numeric closest: compute difference
   const desired = parseInt(String(preferred).replace(/[^0-9]/g, ""), 10) || 480;
   let best = null;
   let bestDiff = Infinity;
@@ -515,7 +515,8 @@ cmd(
 
       // Send file as document
       const buffer = await fs.readFile(downloadedFile);
-      const safeTitle = (item.title || "pornhub").replace(/[^\w\s.-()]/g, "").slice(0, 60);
+      // FIX: escape '-' inside character class by placing it last or escaping it. using safe regex below
+      const safeTitle = (item.title || "pornhub").replace(/[^\w\s.\-()]/g, "").slice(0, 60);
       const safeName = `${safeTitle}-${(chosen.quality || "unknown")}${ext}`;
       try {
         await robin.sendMessage(
