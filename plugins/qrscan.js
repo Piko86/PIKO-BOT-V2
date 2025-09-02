@@ -1,39 +1,24 @@
 const { cmd } = require("../command");
-const QrCode = require("qrcode-reader");
 const axios = require("axios");
-
-// Robust Jimp import to handle ESM/CJS differences across versions
-let JimpModule;
-try {
-  JimpModule = require("jimp");
-} catch (err) {
-  JimpModule = null;
-}
-const Jimp = JimpModule && (JimpModule.default || JimpModule);
-
-if (!Jimp || typeof Jimp.read !== "function") {
-  // Do not throw at import time to avoid crashing require; we'll check again at runtime and produce a helpful error
-  console.warn(
-    "Warning: Jimp.read not found. If qrscan fails, install a compatible Jimp version: `npm i jimp@0.16.1` or adjust import for ESM. Current Jimp export shape:",
-    !!JimpModule ? Object.keys(JimpModule).slice(0, 10) : "Jimp not installed"
-  );
-}
+const sharp = require("sharp");
+const jsQR = require("jsqr");
 
 /**
- * QR Scanner plugin for WhatsApp bot
+ * QR Scanner plugin (no Jimp)
  *
- * Command:
- *   .qrscan           -> send this command as caption of an image
- *   .qrscan (reply)   -> reply to an image with this command
- *   .qrscan <url>     -> give an image URL as argument
+ * Replaces Jimp + qrcode-reader with sharp + jsqr:
+ * - sharp loads and decodes image to raw RGBA pixels (fast, reliable, maintained)
+ * - jsqr scans raw pixel data (works with the RGBA buffer from sharp)
  *
- * Behavior:
- * - Accepts an image either by replying to it, sending the command as the image caption,
- *   or by providing a public image URL as the command argument.
- * - Downloads the image, decodes any QR code present, and returns the decoded text.
+ * Usage:
+ *  - Reply to an image with the message ".qrscan"
+ *  - Send an image with caption ".qrscan"
+ *  - Use ".qrscan <image_url>"
  *
- * Dependencies:
- *   npm i jimp qrcode-reader axios
+ * Install:
+ *  npm i sharp jsqr axios
+ *
+ * Note: sharp requires native libvips; on many systems npm will install prebuilt binaries.
  */
 
 cmd(
@@ -48,10 +33,7 @@ cmd(
     try {
       await robin.sendMessage(from, { text: "⏳ Scanning image for QR code, please wait..." }, { quoted: mek });
 
-      // Helper: try to get image buffer from three sources:
-      // 1) URL provided as argument
-      // 2) Reply to an image (quoted)
-      // 3) Image sent with this message (message itself)
+      // Get image buffer from URL / quoted message / current message
       async function getImageBuffer() {
         // 1) If argument is a URL, fetch it
         if (q && /^https?:\/\//i.test(q.trim())) {
@@ -60,23 +42,30 @@ cmd(
           return Buffer.from(res.data);
         }
 
+        // Helper to attempt client download helper first (many WhatsApp libs provide it)
+        async function tryClientDownload(msgObj) {
+          if (!msgObj) return null;
+          try {
+            if (typeof robin.downloadMediaMessage === "function") {
+              // Some wrappers expect the quoted message object or the message.message shape
+              const candidate = msgObj;
+              const buff = await robin.downloadMediaMessage(candidate).catch(() => null);
+              if (buff && Buffer.isBuffer(buff)) return buff;
+              if (buff && buff.data) return Buffer.from(buff.data);
+            }
+          } catch (e) {
+            // ignore and continue to other strategies
+          }
+          return null;
+        }
+
         // 2) If user replied to a message (quoted)
         if (quoted) {
           const quotedMsg = quoted.message || quoted;
-          // Preferred: use the client's download helper if available
-          if (typeof robin.downloadMediaMessage === "function") {
-            try {
-              let candidate = quoted;
-              if (quotedMsg && (quotedMsg.imageMessage || quotedMsg.videoMessage || quotedMsg.stickerMessage)) candidate = quotedMsg;
-              const buffer = await robin.downloadMediaMessage(candidate).catch(() => null);
-              if (buffer && Buffer.isBuffer(buffer)) return buffer;
-              if (buffer && buffer.data) return Buffer.from(buffer.data);
-            } catch (e) {
-              // ignore and continue to other strategies
-            }
-          }
+          const buff = await tryClientDownload(quoted).catch(() => null);
+          if (buff) return buff;
 
-          // Fallback: try common fields with direct URLs
+          // Fallback: try to fetch direct URL fields if present
           try {
             const imgInfo = quotedMsg.imageMessage || quotedMsg.message?.imageMessage || quotedMsg;
             const possibleUrl = imgInfo?.url || imgInfo?.murl || imgInfo?.directPath;
@@ -85,21 +74,18 @@ cmd(
               return Buffer.from(res.data);
             }
           } catch (e) {
-            // ignore and continue
+            // ignore
           }
         }
 
         // 3) If the current message itself contains image media (user sent image with caption .qrscan)
         try {
           const currentMsg = mek?.message || m?.message || {};
-          const imageMsg = currentMsg.imageMessage || currentMsg.message?.imageMessage || null;
-          if (imageMsg) {
-            if (typeof robin.downloadMediaMessage === "function") {
-              const buffer = await robin.downloadMediaMessage(currentMsg).catch(() => null);
-              if (buffer && Buffer.isBuffer(buffer)) return buffer;
-              if (buffer && buffer.data) return Buffer.from(buffer.data);
-            }
-            const possibleUrl = imageMsg.url || imageMsg.murl || imageMsg.directPath;
+          const imgMsg = currentMsg.imageMessage || currentMsg.message?.imageMessage || null;
+          if (imgMsg) {
+            const buff = await tryClientDownload(mek || m).catch(() => null);
+            if (buff) return buff;
+            const possibleUrl = imgMsg.url || imgMsg.murl || imgMsg.directPath;
             if (possibleUrl && /^https?:\/\//i.test(possibleUrl)) {
               const res = await axios.get(possibleUrl, { responseType: "arraybuffer", timeout: 20000 });
               return Buffer.from(res.data);
@@ -109,63 +95,59 @@ cmd(
           // ignore
         }
 
-        // If nothing found
         return null;
       }
 
       const imageBuffer = await getImageBuffer();
       if (!imageBuffer) return reply("❌ No image found. Please reply to an image or send an image with the caption `.qrscan`, or provide an image URL.");
 
-      // Ensure Jimp is available and has read
-      if (!Jimp || typeof Jimp.read !== "function") {
-        return reply(
-          "❌ QR scanning failed because the image library (Jimp) is not available in a compatible form.\n" +
-            "Fix options:\n" +
-            "1) Install a compatible Jimp version: `npm i jimp@0.16.1`\n" +
-            "2) If using a newer Jimp (ESM), run node with ESM support or adjust the import to use `.default`.\n\n" +
-            "After installing, restart the bot and try again."
-        );
+      // Use sharp to decode image to raw RGBA; resize to reasonable max to improve speed/accuracy
+      // (keeps aspect ratio)
+      const MAX_DIMENSION = 1200; // max width or height to process
+      let raw;
+      try {
+        // rotate() respects EXIF orientation
+        const pipeline = sharp(imageBuffer).rotate().resize({ width: MAX_DIMENSION, height: MAX_DIMENSION, fit: "inside" }).ensureAlpha();
+        const { data, info } = await pipeline.raw().toBuffer({ resolveWithObject: true });
+        raw = { data, width: info.width, height: info.height };
+      } catch (e) {
+        console.error("sharp processing failed:", e);
+        return reply("❌ Failed to process the image. The image may be corrupted or unsupported.");
       }
 
-      // Load image with Jimp and decode QR
-      const jimage = await Jimp.read(imageBuffer);
-      const qr = new QrCode();
-
-      const scanResult = await new Promise((resolve, reject) => {
-        qr.callback = (err, value) => {
-          if (err) return reject(err);
-          resolve(value);
-        };
-        try {
-          qr.decode(jimage.bitmap);
-        } catch (err) {
-          reject(err);
-        }
-      });
-
-      if (!scanResult || !scanResult.result) {
-        return reply("❌ No QR code detected in the image. Try a clearer or larger image with the QR centered.");
+      if (!raw || !raw.data || !raw.width || !raw.height) {
+        return reply("❌ Unable to decode image pixels for QR scanning.");
       }
 
-      const decoded = (scanResult.result || "").trim();
+      // jsQR expects a Uint8ClampedArray (RGBA buffer is acceptable)
+      const imageData = new Uint8ClampedArray(raw.data);
 
-      // Try to detect some common QR content types (URL, vCard)
-      let extra = "";
+      // Try to decode QR from the image
+      const code = jsQR(imageData, raw.width, raw.height, { inversionAttempts: "attemptBoth" });
+
+      if (!code || !code.data) {
+        return reply("❌ No QR code detected in the image. Try a clearer/cropped image with the QR centered.");
+      }
+
+      const decoded = String(code.data).trim();
+
+      // Attempt to detect vCard / URL / plain text
+      let summary = "";
       if (/^https?:\/\//i.test(decoded)) {
-        extra = `🔗 Detected URL: ${decoded}`;
+        summary = `🔗 Detected URL: ${decoded}`;
       } else if (/BEGIN:VCARD/i.test(decoded)) {
         const fnMatch = decoded.match(/FN:(.+)/i);
         const telMatch = decoded.match(/TEL[^:]*:(.+)/i);
         const fn = fnMatch ? fnMatch[1].trim() : null;
         const tel = telMatch ? telMatch[1].trim() : null;
-        extra = `📇 Detected vCard${fn ? `\n• Name: ${fn}` : ""}${tel ? `\n• Phone: ${tel}` : ""}`;
+        summary = `📇 Detected vCard${fn ? `\n• Name: ${fn}` : ""}${tel ? `\n• Phone: ${tel}` : ""}`;
       } else {
-        extra = `💬 Decoded text (${decoded.length} chars):\n${decoded.length > 300 ? decoded.slice(0, 300) + "..." : decoded}`;
+        summary = `💬 Decoded text (${decoded.length} chars):\n${decoded.length > 600 ? decoded.slice(0, 600) + "..." : decoded}`;
       }
 
-      await robin.sendMessage(from, { text: `✅ QR code scanned successfully!\n\n${extra}` }, { quoted: mek });
+      await robin.sendMessage(from, { text: `✅ QR code scanned successfully!\n\n${summary}` }, { quoted: mek });
 
-      // Full decoded content for copy/paste
+      // Also send full decoded content as plain text for copying
       await robin.sendMessage(from, { text: `Full decoded content:\n${decoded}` }, { quoted: mek });
     } catch (e) {
       console.error("qrscan error:", e);
