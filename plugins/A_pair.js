@@ -1,85 +1,67 @@
-const { 
-  makeWASocket, 
-  useMultiFileAuthState, 
-  fetchLatestBaileysVersion 
-} = require("@whiskeysockets/baileys");
-const P = require("pino");
-const fs = require("fs");
+const { makeWASocket, useMultiFileAuthState } = require("@whiskeysockets/baileys");
 const path = require("path");
+const fs = require("fs");
 const { cmd } = require("../command");
 
-// Store running sessions in memory
-let userSessions = {};
-
-/**
- * Start bot instance for user
- */
-async function startUserBot(userId, reply) {
+async function startUserBot(userId, sendReply) {
   const sessionDir = path.join(__dirname, "..", "sessions", userId);
 
-  // Ensure session directory exists
   if (!fs.existsSync(sessionDir)) {
     fs.mkdirSync(sessionDir, { recursive: true });
   }
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-  const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
-    version,
-    logger: P({ level: "silent" }),
     auth: state,
-    printQRInTerminal: false
+    printQRInTerminal: false, // pairing only
   });
 
   sock.ev.on("creds.update", saveCreds);
 
-  // Generate pairing code if not logged in yet
-  if (!sock.authState.creds.registered) {
-    const code = await sock.requestPairingCode(userId);
-    reply(
-      `🔗 *Your WhatsApp Pairing Code:*\n\n` +
-      `👉 ${code}\n\n` +
-      `Go to *WhatsApp → Linked Devices → Link with phone number* and enter this code.`
-    );
-  } else {
-    reply("✅ You are already paired and logged in!");
-  }
+  sock.ev.on("connection.update", async (update) => {
+    const { connection } = update;
 
-  // Example: Echo received messages (you can extend later)
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg.message) return;
-    console.log(`[${userId}] Received:`, msg.message);
+    if (connection === "open") {
+      console.log(`✅ ${userId} session is ready!`);
+      await sendReply(`✅ Your session has been linked successfully!`);
+    }
 
-    if (msg.message.conversation?.toLowerCase() === "hi") {
-      await sock.sendMessage(msg.key.remoteJid, { text: "Hello! 👋 (from your session)" });
+    if (connection === "close") {
+      console.log(`❌ ${userId} session closed.`);
     }
   });
 
-  // Store active session
-  userSessions[userId] = sock;
-  console.log(`✅ Started session for ${userId}`);
+  // ✅ request pairing code after small delay to ensure socket starts
+  setTimeout(async () => {
+    try {
+      const code = await sock.requestPairingCode(userId);
+      console.log(`📲 Pairing code for ${userId}: ${code}`);
+      await sendReply(
+        `🔑 *Your WhatsApp Pairing Code:*\n\n\`\`\`${code}\`\`\`\n\n👉 Open *WhatsApp > Linked Devices > Link a Device* and enter this code.`
+      );
+    } catch (err) {
+      console.error("Pairing Error:", err);
+      await sendReply(`❌ Pairing failed: ${err.message || err}`);
+    }
+  }, 2000);
 }
 
-/**
- * Command: .pair
- */
 cmd(
   {
     pattern: "pair",
-    desc: "Generate WhatsApp Pairing Code",
-    category: "main",
+    desc: "Pair your WhatsApp number with the bot",
+    category: "owner",
+    react: "🔗",
     filename: __filename,
   },
-  async (robin, mek, m, { senderNumber, reply }) => {
-    try {
-      await startUserBot(senderNumber, reply);
-    } catch (e) {
-      console.error("Pairing Error:", e);
-      reply("❌ Error while generating pairing code: " + e.message);
-    }
+  async (conn, mek, m, { from, sender }) => {
+    const userId = sender.split("@")[0]; // user’s phone number
+    const sendReply = async (text) => {
+      await conn.sendMessage(from, { text }, { quoted: mek });
+    };
+
+    await sendReply(`🔄 Generating your pairing code, please wait...`);
+    await startUserBot(userId, sendReply);
   }
 );
-
-module.exports = { userSessions, startUserBot };
