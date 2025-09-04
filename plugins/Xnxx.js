@@ -348,9 +348,7 @@ async function sendFileBuffer(robin, to, buffer, originalTitle, candidateUrl, me
  * - Each expects a single URL after the command.
  */
 const sites = [
-  { cmdName: "pornhub", hostPattern: /pornhub\.com/i, extractor: extractPornhub },
-  { cmdName: "xvideos", hostPattern: /xvideos\.com/i, extractor: extractXvideos },
-  { cmdName: "xhamster", hostPattern: /xhamster\.com/i, extractor: extractXhamster },
+  { cmdName: "xvideos", hostPattern: [/xvideos\.com/i,/xvideos2\.com/i],extractor: extractXvideos },
 ];
 
 for (const site of sites) {
