@@ -73,13 +73,11 @@ cmd(
 
       // Handle pairing code generation
       sock.ev.on("connection.update", async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+        const { connection, lastDisconnect } = update;
 
-        if (qr) {
-          // Generate pairing link
-          const pairingLink = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qr)}`;
-          
-          const pairingMessage = `📱 *WHATSAPP PAIRING CODE*
+        if (connection === "open") {
+          // Successfully connected
+          const successMessage = `✅ *PAIRING SUCCESSFUL!*
 
 *╭─「 ᴘᴀɪʀɪɴɢ ɪɴꜱᴛʀᴜᴄᴛɪᴏɴꜱ 」*
 *│◈ Session ID:* ${sessionId.substring(0, 8)}...
@@ -193,6 +191,64 @@ ${pairingLink}
 
       // Handle credential updates
       sock.ev.on("creds.update", saveCreds);
+
+      // Request pairing code for the user's number
+      if (!sock.authState.creds.registered) {
+        setTimeout(async () => {
+          try {
+            const code = await sock.requestPairingCode(senderNumber);
+            
+            const pairingMessage = `📱 *WHATSAPP PAIRING CODE*
+
+*╭─「 ᴘᴀɪʀɪɴɢ ᴄᴏᴅᴇ 」*
+*│◈ Your Code:* \`${code}\`
+*│◈ Valid for:* 3 minutes
+*│◈ Status:* Waiting for pairing
+*╰──────────●●►*
+
+*📋 HOW TO PAIR:*
+*1.* Open WhatsApp on your phone
+*2.* Go to *Settings > Linked Devices*
+*3.* Tap *"Link a Device"*
+*4.* Select *"Link with phone number instead"*
+*5.* Enter this code: \`${code}\`
+*6.* Your device will be connected!
+
+*⚠️ IMPORTANT NOTES:*
+• This code expires in 3 minutes
+• Only you should use this code
+• Keep this code private and secure
+• The bot will notify you when connected
+
+*🔒 Your connection will be secure and encrypted*
+
+*㋛ 𝙿𝙾𝚆𝙴𝚁𝙳 𝙱𝚈 𝙿_𝙸_𝙺_𝙾 〽️*`;
+
+            await robin.sendMessage(
+              from,
+              {
+                text: pairingMessage,
+                contextInfo: {
+                  mentionedJid: [`${senderNumber}@s.whatsapp.net`]
+                }
+              },
+              { quoted: mek }
+            );
+          } catch (error) {
+            console.error("Pairing code error:", error);
+            await robin.sendMessage(
+              from,
+              {
+                text: `❌ *PAIRING ERROR*\n\n*Failed to generate pairing code.*\n\n*Error:* ${error.message}\n\n*💡 Please try again with .pair*`,
+                contextInfo: {
+                  mentionedJid: [`${senderNumber}@s.whatsapp.net`]
+                }
+              },
+              { quoted: mek }
+            );
+          }
+        }, 3000);
+      }
 
       console.log(`📱 Pairing session ${sessionId} created for ${senderNumber}`);
 
