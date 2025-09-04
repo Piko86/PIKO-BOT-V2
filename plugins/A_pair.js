@@ -1,178 +1,207 @@
+/**
+ * Safer pairing command for Baileys.
+ *
+ * Improvements:
+ * - Do not call logout() or destroy socket while pairing handshake is in flight.
+ * - Wait for a stable 'open' connection event (me present) before confirming pairing.
+ * - Persist creds via saveCreds and only recreate socket after a short controlled delay.
+ * - Better logging of lastDisconnect details for debugging 401/Intentional Logout.
+ * - Fewer restarts during pairing; if unrecoverable 401 occurs we stop and ask user to retry.
+ *
+ * Usage: .pair  (run in a private chat)
+ *
+ * Notes:
+ * - If you run this in Codespaces and pairing repeatedly fails with "Connection Failure" or 401,
+ *   try from a local machine or VPS (Codespaces sometimes has unstable websocket connections).
+ * - Inspect sessions/<phone> contents after pairing to confirm saved creds.
+ */
 const { makeWASocket, useMultiFileAuthState } = require("@whiskeysockets/baileys");
 const path = require("path");
 const fs = require("fs");
 const { cmd } = require("../command");
 
-/**
- * Improved pairing command implementation
- *
- * Improvements:
- * - Robust try/catch around auth state and socket creation
- * - Prevent duplicate sessions for the same user (activeSessions map)
- * - Detect available pairing API on the Baileys socket and handle gracefully
- * - Keep socket reference in-memory to allow cleanup and avoid leaks
- * - Send privacy reminder and clearer error messages
- * - Cleanup on connection close and on errors
- * - Timeouts and more explicit logging
- *
- * Notes:
- * - Run the .pair command in a private/DM chat to avoid exposing the pairing code.
- * - If your Baileys version exposes a different pairing API, you may need to adapt the detect/request logic.
- */
+const activeSessions = new Map(); // userId -> { sock, timeoutHandle, stateSaved }
 
-const activeSessions = new Map(); // userId -> { sock, sessionDir, timeoutHandle }
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function ensureDir(dir) {
+  try {
+    await fs.promises.mkdir(dir, { recursive: true });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function listSessionFiles(sessionDir) {
+  try {
+    const files = await fs.promises.readdir(sessionDir);
+    return files;
+  } catch (e) {
+    return [];
+  }
+}
 
 async function startUserBot(userId, sendReply) {
   if (!userId) throw new Error("Missing userId");
-
-  // Prevent duplicate sessions
   if (activeSessions.has(userId)) {
-    await sendReply("⚠️ You already have an active pairing session. If you need a new code, first stop the existing session or wait for it to expire.");
+    await sendReply("⚠️ There is already an active pairing session for you. Wait for it to finish or use .unpair first.");
     return;
   }
 
   const sessionDir = path.join(__dirname, "..", "sessions", userId);
-  try {
-    if (!fs.existsSync(sessionDir)) {
-      fs.mkdirSync(sessionDir, { recursive: true });
-    }
-  } catch (err) {
-    console.error("Failed to create session directory:", err);
-    await sendReply(`❌ Failed to prepare session storage: ${err.message || err}`);
+  if (!(await ensureDir(sessionDir))) {
+    await sendReply("❌ Failed to create session storage (check permissions).");
     return;
   }
 
-  // Acquire persisted auth state
-  let state, saveCreds;
+  // initialize auth state
+  let authState;
   try {
-    const auth = await useMultiFileAuthState(sessionDir);
-    state = auth.state;
-    saveCreds = auth.saveCreds;
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    authState = { state, saveCreds };
   } catch (err) {
     console.error("useMultiFileAuthState error:", err);
-    await sendReply(`❌ Failed to initialize auth state: ${err.message || err}`);
+    await sendReply(`❌ Failed to initialize auth storage: ${err?.message || err}`);
     return;
   }
 
-  // Create socket
+  // create socket
   let sock;
-  try {
-    sock = makeWASocket({
-      auth: state,
-      printQRInTerminal: false, // we will request pairing code programmatically
+  let finalized = false; // set to true when we decide pairing succeeded or irrecoverable
+  let restartAttempts = 0;
+
+  const createSocket = () => {
+    const s = makeWASocket({
+      auth: authState.state,
+      printQRInTerminal: false,
     });
-  } catch (err) {
-    console.error("makeWASocket error:", err);
-    await sendReply(`❌ Failed to create WhatsApp socket: ${err.message || err}`);
-    return;
-  }
+    if (typeof authState.saveCreds === "function") s.ev.on("creds.update", authState.saveCreds);
+    s.ev.on("connection.update", async (update) => {
+      try {
+        const { connection, lastDisconnect, me, qr } = update;
+        console.log("connection.update:", { connection, me: me?.id, lastDisconnect: lastDisconnect ? {
+          statusCode: lastDisconnect.statusCode,
+          message: lastDisconnect.error?.message || lastDisconnect.error || null,
+          output: lastDisconnect.error?.output || null
+        } : null });
 
-  // persist creds updates
-  if (typeof saveCreds === "function") {
-    sock.ev.on("creds.update", saveCreds);
-  }
+        // If socket becomes open => pairing + login succeeded
+        if (connection === "open" && me?.id) {
+          // confirm saved files exist (best-effort)
+          const files = await listSessionFiles(sessionDir);
+          await sendReply(`✅ Pairing succeeded. Session ready for ${me.id}.\nSaved session files: ${files.join(", ") || "(none)"}\nYou can close this window on your phone now if you want.`);
+          finalized = true;
+          // keep socket running (do not logout); the session is active.
+          // Register sock in activeSessions so it won't create duplicates.
+          activeSessions.set(userId, { sock: s, timeoutHandle: null, stateSaved: true });
+          return;
+        }
 
-  // store session so we can avoid duplicates and close later
-  activeSessions.set(userId, { sock, sessionDir });
+        if (connection === "close") {
+          // Log lastDisconnect details for debugging
+          const last = lastDisconnect || {};
+          const errObj = last.error || last;
+          const code = last.statusCode || (errObj && errObj.output && errObj.output.payload && errObj.output.payload.statusCode) || null;
+          const msg = errObj?.message || (errObj?.output && JSON.stringify(errObj.output.payload)) || String(errObj);
+          console.warn(`Connection closed for ${userId} - code: ${code} - msg: ${msg}`);
 
-  // Setup cleanup on connection close / error
-  const cleanup = async (reason) => {
-    try {
-      const session = activeSessions.get(userId);
-      if (session && session.timeoutHandle) clearTimeout(session.timeoutHandle);
-      if (session && session.sock) {
-        try {
-          await session.sock.logout().catch(() => {});
-        } catch {}
+          // If 401 Intentional Logout or other authorization failures -> stop and ask user to retry
+          if (code === 401 || (msg && /Intentional Logout|Unauthorized/i.test(msg))) {
+            await sendReply(`❌ Pairing failed: Unauthorized/Intentional Logout (${msg}). This is usually caused by conflicting sessions or invalid credentials.\nPlease:\n• Ensure you did not link the same number elsewhere\n• Remove any existing session files for this phone under sessions/${userId} and run .pair again\n• Prefer running pairing from a local machine instead of Codespaces if problem persists.`);
+            finalized = true;
+            try { await s.logout().catch(()=>{}); } catch {}
+            activeSessions.delete(userId);
+            return;
+          }
+
+          // For transient issues (timeouts / stream errors) try a small number of restarts,
+          // but avoid tight loops during the pairing handshake. We only attempt restart if we haven't finalized.
+          if (!finalized) {
+            restartAttempts += 1;
+            const MAX_RESTARTS = 3;
+            if (restartAttempts > MAX_RESTARTS) {
+              await sendReply(`❌ Pairing retried ${MAX_RESTARTS} times and failed. Please try again later or run pairing from a different network.`);
+              finalized = true;
+              activeSessions.delete(userId);
+              try { await s.logout().catch(()=>{}); } catch {}
+              return;
+            }
+            const backoff = Math.min(10000, 2000 * restartAttempts);
+            await sendReply(`⚠️ Connection closed (${msg || code}). Retrying in ${Math.round(backoff/1000)}s...`);
+            // remove previous sock listeners and create new sock after delay
+            try { s.ev.removeAllListeners(); } catch {}
+            await sleep(backoff);
+            if (finalized) return;
+            // create new socket and rebind
+            sock = createSocket();
+            activeSessions.set(userId, { sock, timeoutHandle: null, stateSaved: false });
+            return;
+          }
+        }
+      } catch (e) {
+        console.error("Error in connection.update handler:", e);
       }
-    } catch (e) {
-      // ignore
-    } finally {
-      activeSessions.delete(userId);
-      console.log(`Session for ${userId} cleaned up${reason ? ` (${reason})` : ""}`);
-    }
+    });
+    return s;
   };
 
-  sock.ev.on("connection.update", async (update) => {
-    try {
-      const { connection, lastDisconnect } = update;
-      console.log(`Connection update for ${userId}:`, connection);
-      if (connection === "open") {
-        await sendReply("✅ Your session is linked. You can now use your linked device.");
-      } else if (connection === "close") {
-        console.warn(`Connection closed for ${userId}`, lastDisconnect || "");
-        await cleanup("connection closed");
-      }
-    } catch (e) {
-      console.error("Error handling connection.update:", e);
+  // Put initial socket in activeSessions while pairing is in progress
+  sock = createSocket();
+  activeSessions.set(userId, { sock, timeoutHandle: null, stateSaved: false });
+
+  // Request pairing code (some bailey versions use different method names)
+  try {
+    await sendReply("🔐 Generating pairing code — make sure you run this command in a private chat (not a group).");
+    let code;
+    if (typeof sock.requestPairingCode === "function") {
+      code = await sock.requestPairingCode(userId);
+    } else if (typeof sock.generatePairingCode === "function") {
+      code = await sock.generatePairingCode(userId);
+    } else if (typeof sock.generatePairingCodeForDevice === "function") {
+      code = await sock.generatePairingCodeForDevice(userId);
+    } else {
+      await sendReply("❌ Your Baileys version does not expose a pairing method. Update Baileys or adapt the pairing function names.");
+      finalized = true;
+      activeSessions.delete(userId);
+      try { await sock.logout().catch(()=>{}); } catch {}
+      return;
     }
-  });
 
-  sock.ev.on("creds.update", () => {
-    // creds are persisted by saveCreds above; event retained for logging
-    console.log(`Credentials updated for ${userId}`);
-  });
-
-  // Request pairing code. Baileys versions may expose different APIs; detect available method.
-  // We will try sock.requestPairingCode or sock.generatePairingCode (some forks expose different names).
-  setTimeout(async () => {
-    try {
-      if (!sock || sock.state === "closed") {
-        await sendReply("❌ Socket is not available for pairing.");
-        await cleanup("socket not available");
-        return;
-      }
-
-      // Privacy note — pairing codes should not be posted publicly
-      await sendReply("🔐 Please ensure you run this command in a private chat (not a group). The pairing code will be shown below.");
-
-      // detect method
-      let code;
-      if (typeof sock.requestPairingCode === "function") {
-        code = await sock.requestPairingCode(userId).catch((err) => { throw err; });
-      } else if (typeof sock.generatePairingCode === "function") {
-        code = await sock.generatePairingCode(userId).catch((err) => { throw err; });
-      } else if (typeof sock.generatePairingCodeForDevice === "function") {
-        // hypothetical API name on some forks
-        code = await sock.generatePairingCodeForDevice(userId).catch((err) => { throw err; });
-      } else {
-        throw new Error("Pairing API not available in this Baileys version. Update Baileys or adapt the code.");
-      }
-
-      if (!code) {
-        throw new Error("No pairing code returned by Baileys API.");
-      }
-
-      console.log(`Pairing code for ${userId}:`, code);
-
-      await sendReply(
-        `🔑 *Your WhatsApp Pairing Code:*\n\n\`\`\`${code}\`\`\`\n\n👉 Open *WhatsApp > Linked Devices > Link a Device* and enter this code.`
-      );
-
-      // Set an inactivity expiry: clean the session if not used within X minutes
-      const EXPIRY_MS = (process.env.PAIRING_SESSION_EXPIRE_MINUTES ? parseInt(process.env.PAIRING_SESSION_EXPIRE_MINUTES, 10) : 10) * 60 * 1000;
-      const timeoutHandle = setTimeout(async () => {
-        try {
-          await sendReply(`⌛ Pairing session expired after ${Math.round(EXPIRY_MS / 60000)} minute(s). Run .pair again if needed.`);
-        } catch (e) {}
-        await cleanup("pairing timeout");
-      }, EXPIRY_MS);
-
-      const session = activeSessions.get(userId) || {};
-      session.timeoutHandle = timeoutHandle;
-      activeSessions.set(userId, session);
-    } catch (err) {
-      console.error("Pairing Error:", err);
-      try {
-        await sendReply(`❌ Pairing failed: ${err.message || err}`);
-      } catch (e) {}
-      // cleanup on failure
-      await cleanup("pairing error");
+    if (!code) {
+      await sendReply("❌ No pairing code returned by Baileys.");
+      finalized = true;
+      activeSessions.delete(userId);
+      try { await sock.logout().catch(()=>{}); } catch {}
+      return;
     }
-  }, 1000);
+
+    await sendReply(`🔑 *Your Pairing Code:*\n\`\`\`${code}\`\`\`\nOpen WhatsApp -> Linked Devices -> Link a Device and enter the code. Pairing will complete on successful entry.`);
+
+    // Set expiry for pairing attempt (user has X minutes to scan/link)
+    const EXPIRE_MIN = parseInt(process.env.PAIRING_SESSION_EXPIRE_MINUTES || "10", 10);
+    const timeoutHandle = setTimeout(async () => {
+      if (finalized) return;
+      await sendReply(`⌛ Pairing session expired after ${EXPIRE_MIN} minutes. Run .pair again if needed.`);
+      finalized = true;
+      try { await sock.logout().catch(()=>{}); } catch {}
+      activeSessions.delete(userId);
+    }, EXPIRE_MIN * 60 * 1000);
+
+    // store timeout handle so future code can clear it if pairing finalizes
+    const st = activeSessions.get(userId) || {};
+    st.timeoutHandle = timeoutHandle;
+    activeSessions.set(userId, st);
+  } catch (err) {
+    console.error("Pairing request error:", err);
+    await sendReply(`❌ Pairing request failed: ${err?.message || err}`);
+    finalized = true;
+    try { await sock.logout().catch(()=>{}); } catch {}
+    activeSessions.delete(userId);
+    return;
+  }
 }
 
-// Command registration
 cmd(
   {
     pattern: "pair",
@@ -183,33 +212,16 @@ cmd(
   },
   async (conn, mek, m, { from, sender }) => {
     try {
-      // Validation
-      if (!sender) return await conn.sendMessage(from, { text: "❌ Unable to determine sender ID." }, { quoted: mek });
-
+      if (!sender) return await conn.sendMessage(from, { text: "❌ Could not determine sender ID." }, { quoted: mek });
       const userId = String(sender).split("@")[0];
-      if (!/^\d+$/.test(userId)) {
-        // If the extracted userId is not numeric, warn but continue (some JID formats differ)
-        await conn.sendMessage(from, { text: `⚠️ Detected user id: ${userId}. If pairing fails, try using your phone number (e.g. 1234567890).` }, { quoted: mek });
-      }
-
-      // sendReply helper
       const sendReply = async (text) => {
-        try {
-          // Always send the pairing code to the chat where the command was executed.
-          // If you want to deliver it privately, replace `from` below with the user's direct JID.
-          await conn.sendMessage(from, { text }, { quoted: mek });
-        } catch (e) {
-          console.error("sendReply error:", e);
-        }
+        try { await conn.sendMessage(from, { text }, { quoted: mek }); } catch (e) { console.error("sendReply error:", e); }
       };
-
-      await sendReply("🔄 Generating your pairing code, please wait...");
+      await sendReply("🔄 Preparing pairing. Please wait...");
       await startUserBot(userId, sendReply);
     } catch (e) {
       console.error("pair command error:", e);
-      try {
-        await conn.sendMessage(from, { text: `❌ Error: ${e.message || "Unknown error"}` }, { quoted: mek });
-      } catch {}
+      try { await conn.sendMessage(from, { text: `❌ Error: ${e?.message || e}` }, { quoted: mek }); } catch {}
     }
   }
 );
