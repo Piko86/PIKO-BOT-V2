@@ -1,3 +1,7 @@
+Skip to content
+Chat history
+
+You said:
 const { 
   makeWASocket, 
   useMultiFileAuthState, 
@@ -8,196 +12,67 @@ const fs = require("fs");
 const path = require("path");
 const { cmd } = require("../command");
 
-// In-memory store of active user sessions
+// Store running sessions in memory
 let userSessions = {};
 
-// Ensure base sessions directory exists
-const SESSIONS_BASE = path.join(__dirname, "..", "sessions");
-if (!fs.existsSync(SESSIONS_BASE)) fs.mkdirSync(SESSIONS_BASE, { recursive: true });
-
 /**
- * Normalize a sender identifier for filesystem (keep digits only).
- * Accepts formats like "1234567890" or "1234567890@s.whatsapp.net"
- */
-function normalizeId(id) {
-  return String(id || "").replace(/[^0-9]/g, "");
-}
-
-/**
- * Start (or resume) a WhatsApp session for a user and generate a pairing code if needed.
- * - userId: sender identifier (phone number or senderNumber)
- * - reply: function to send replies back to the user (string)
+ * Start bot instance for user
  */
 async function startUserBot(userId, reply) {
-  const normalized = normalizeId(userId);
-  if (!normalized) {
-    return reply("❌ Could not normalize your number. Please ensure your sender id is correct.");
+  const sessionDir = path.join(__dirname, "..", "sessions", userId);
+
+  // Ensure session directory exists
+  if (!fs.existsSync(sessionDir)) {
+    fs.mkdirSync(sessionDir, { recursive: true });
   }
 
-  // If a session is already running for this user, inform them
-  if (userSessions[normalized]) {
-    const runningSock = userSessions[normalized];
-    // If already registered, inform the user
-    const isRegistered = runningSock?.authState?.creds?.registered || false;
-    if (isRegistered) return reply("✅ Your session is already active and paired.");
-    // if sock exists but not registered, just inform that the pairing code is being awaited
-    return reply("ℹ️ Session already started, waiting for pairing. Check WhatsApp > Linked Devices > Link with phone number.");
+  const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+  const { version } = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    logger: P({ level: "silent" }),
+    auth: state,
+    printQRInTerminal: false
+  });
+
+  sock.ev.on("creds.update", saveCreds);
+
+  // Generate pairing code if not logged in yet
+  if (!sock.authState.creds.registered) {
+    const code = await sock.requestPairingCode(userId.toString());
+    reply(
+      🔗 *Your WhatsApp Pairing Code:*\n\n +
+      👉 ${code}\n\n +
+      Go to *WhatsApp → Linked Devices → Link with phone number* and enter this code.
+    );
+  } else {
+    reply("✅ You are already paired and logged in!");
   }
 
-  const sessionDir = path.join(SESSIONS_BASE, normalized);
-  if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+  // Example: Echo received messages (you can extend later)
+  sock.ev.on("messages.upsert", async ({ messages }) => {
+    const msg = messages[0];
+    if (!msg.message) return;
+    console.log([${userId}] Received:, msg.message);
 
-  try {
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version } = await fetchLatestBaileysVersion();
-
-    const sock = makeWASocket({
-      version,
-      logger: P({ level: "silent" }),
-      auth: state,
-      printQRInTerminal: false
-    });
-
-    // Persist credentials when they update
-    sock.ev.on("creds.update", saveCreds);
-
-    // Keep socket reference
-    userSessions[normalized] = sock;
-
-    // Listen to connection updates to detect when pairing is ready or when logged in
-    sock.ev.on("connection.update", (update) => {
-      try {
-        const { connection, lastDisconnect } = update;
-        if (connection === "open") {
-          reply("✅ Paired and logged in successfully!");
-          console.log(`✅ [${normalized}] Paired and connected.`);
-        }
-
-        // You can examine 'lastDisconnect' to provide more info if desired
-        if (connection === "close" && lastDisconnect) {
-          const err = lastDisconnect.error || lastDisconnect?.output || lastDisconnect;
-          console.log(`⚠️ [${normalized}] Connection closed:`, err);
-        }
-      } catch (e) {
-        console.error("connection.update handler error:", e);
-      }
-    });
-
-    // If credentials show not registered, request a pairing code (Baileys exposes pair / pairing helpers depending on version).
-    // Many Baileys variants expose generatePairing code or requestPairingCode (user sample). We'll try to use requestPairingCode if available.
-    const isRegistered = state?.creds?.registered || false;
-    if (!isRegistered) {
-      try {
-        // Some versions implement requestPairingCode on the socket instance
-        if (typeof sock.requestPairingCode === "function") {
-          const code = await sock.requestPairingCode(normalized);
-          reply(
-            `🔗 *Your WhatsApp Pairing Code*\n\n` +
-            `👉 ${code}\n\n` +
-            `Open WhatsApp → Linked Devices → Link with phone number and enter this code.`
-          );
-          console.log(`🔗 Pairing code generated for ${normalized}: ${code}`);
-        } else {
-          // Fallback message if the method isn't available in this Baileys version
-          reply(
-            "🔗 Pairing initialization started.\n" +
-            "If your Baileys build doesn't support automatic pairing code generation, please check the bot logs or upgrade @whiskeysockets/baileys.\n" +
-            "Open WhatsApp → Linked Devices → Link with phone number and follow the on-screen steps."
-          );
-          console.log(`ℹ️ [${normalized}] requestPairingCode() not available in this Baileys build.`);
-        }
-      } catch (pairErr) {
-        console.error(`Pairing code error for ${normalized}:`, pairErr);
-        reply("❌ Failed to generate pairing code: " + (pairErr?.message || pairErr));
-      }
-    } else {
-      reply("✅ You are already paired and logged in!");
+    if (msg.message.conversation?.toLowerCase() === "hi") {
+      await sock.sendMessage(msg.key.remoteJid, { text: "Hello! 👋 (from your session)" });
     }
+  });
 
-    // Basic example message handler (safe/optional)
-    sock.ev.on("messages.upsert", async ({ messages }) => {
-      try {
-        const msg = messages?.[0];
-        if (!msg || !msg.message) return;
-        // Simple echo trigger (customize as needed)
-        if (msg.message.conversation?.toLowerCase() === "hi") {
-          await sock.sendMessage(msg.key.remoteJid, { text: "Hello! 👋 (from your session)" });
-        }
-      } catch (e) {
-        console.error("messages.upsert handler error:", e);
-      }
-    });
-
-    console.log(`✅ Started session for ${normalized}`);
-    return sock;
-  } catch (e) {
-    console.error("startUserBot error:", e);
-    // Clean up any partial state
-    if (userSessions[normalized]) {
-      try { userSessions[normalized].end(); } catch (_) {}
-      delete userSessions[normalized];
-    }
-    return reply("❌ Error while starting session: " + (e?.message || e));
-  }
+  // Store active session
+  userSessions[userId] = sock;
+  console.log(✅ Started session for ${userId});
 }
 
 /**
- * Stop and remove a user's session (logout + cleanup files if requested).
- * - userId: sender identifier
- * - reply: reply function
- * - removeFiles: if true, delete the stored auth files for that user
- */
-async function stopUserBot(userId, reply, removeFiles = false) {
-  const normalized = normalizeId(userId);
-  const sock = userSessions[normalized];
-  if (!sock) return reply("❌ No active session found for your number.");
-
-  try {
-    if (typeof sock.logout === "function") {
-      await sock.logout();
-    } else if (typeof sock.close === "function") {
-      await sock.close();
-    }
-  } catch (e) {
-    console.warn("Error while logging out socket:", e);
-  }
-
-  // Remove in-memory reference
-  delete userSessions[normalized];
-
-  // Optionally remove session folder (auth files)
-  if (removeFiles) {
-    const sessionDir = path.join(SESSIONS_BASE, normalized);
-    try {
-      if (fs.existsSync(sessionDir)) {
-        fs.rmSync(sessionDir, { recursive: true, force: true });
-      }
-    } catch (e) {
-      console.error("Failed to remove session files:", e);
-    }
-  }
-
-  reply("✅ Session stopped for your number" + (removeFiles ? " and session files removed." : "."));
-}
-
-/**
- * Utility to report session status
- */
-async function getUserStatus(userId) {
-  const normalized = normalizeId(userId);
-  const sock = userSessions[normalized];
-  if (!sock) return { active: false };
-  const registered = sock?.authState?.creds?.registered || false;
-  return { active: true, registered };
-}
-
-/**
- * .pair command — generate pairing code / start session
+ * Command: .pair
  */
 cmd(
   {
     pattern: "pair",
-    desc: "Generate WhatsApp Pairing Code and start your personal session",
+    desc: "Generate WhatsApp Pairing Code",
     category: "main",
     filename: __filename,
   },
@@ -205,53 +80,51 @@ cmd(
     try {
       await startUserBot(senderNumber, reply);
     } catch (e) {
-      console.error("Pairing command error:", e);
-      reply("❌ Error while generating pairing code: " + (e?.message || e));
+      console.error("Pairing Error:", e);
+      reply("❌ Error while generating pairing code: " + e.message);
     }
   }
 );
 
-/**
- * .unpair command — stop session and optionally remove files
- */
-cmd(
-  {
-    pattern: "unpair",
-    desc: "Stop your personal WhatsApp session (use .unpair remove to also delete session files)",
-    category: "main",
-    filename: __filename,
-  },
-  async (robin, mek, m, { senderNumber, body, reply }) => {
-    try {
-      const removeFiles = (body || "").trim().toLowerCase().includes("remove");
-      await stopUserBot(senderNumber, reply, removeFiles);
-    } catch (e) {
-      console.error("Unpair command error:", e);
-      reply("❌ Error while stopping session: " + (e?.message || e));
-    }
-  }
-);
+module.exports = { userSessions, startUserBot };                                                                                                         not linking to whatsapp 
+ChatGPT said:
+Got it 👍.
+I see your code is setting up multi-session WhatsApp bots with Baileys and pairing codes.
 
-/**
- * .pairstatus command — check current session state
- */
-cmd(
-  {
-    pattern: "pairstatus",
-    desc: "Show pairing/session status for your number",
-    category: "main",
-    filename: __filename,
-  },
-  async (robin, mek, m, { senderNumber, reply }) => {
-    try {
-      const status = await getUserStatus(senderNumber);
-      if (!status.active) return reply("📋 Session Status: Inactive\nType .pair to start your personal session.");
-      reply(`📋 Session Status: Active\nPaired: ${status.registered ? "Yes" : "No (awaiting pairing)"}\nUse .unpair to stop the session.`);
-    } catch (e) {
-      console.error("Pairstatus command error:", e);
-      reply("❌ Error while checking status: " + (e?.message || e));
-    }
-  }
-);
+The problem is:
+👉 sock.requestPairingCode(userId) is wrong.
 
-module.exports = { userSessions, startUserBot, stopUserBot, getUserStatus };
+requestPairingCode() does not accept a WhatsApp user ID (JID or number). Instead, it needs the phone number you want to link with WhatsApp (including country code, without +). Example: "9477xxxxxxx".
+
+✅ Fix
+Change this line:
+
+const code = await sock.requestPairingCode(userId);
+to:
+
+// Make sure `userId` is the phone number in international format (e.g., 9477xxxxxxx)
+const code = await sock.requestPairingCode(userId.toString());
+⚠️ Important Notes
+Phone number format
+Must be a string like "94771234567".
+Not "user@s.whatsapp.net" or internal IDs.
+
+Pairing flow
+
+Open WhatsApp on phone → Linked devices → Link with phone number.
+
+Enter the pairing code your bot prints.
+
+Baileys version
+Make sure you’re using @whiskeysockets/baileys >= 6.7.5. Pairing codes are not available in older versions.
+
+Multi-user sessions
+You’re saving sessions under /sessions/<userId>. That’s fine, but make sure you call startUserBot("9477xxxxxxx", reply) with the correct number, not just the WhatsApp JID.
+
+👉 Do you want me to adjust your .pair command so the bot asks the user for their number, then generates the correct code? That way you won’t need to hardcode userId.
+
+
+
+
+No file chosenNo file chosen
+ChatGPT can make mistakes. Check important info.
