@@ -1,15 +1,15 @@
 /**
- * plugins/video2mp3.js
+ * plugins/reply_video2mp3.js
  *
- * Command: .video2mp3 (with a video file attachment)
- * - Extracts audio from an uploaded video and converts it to MP3 format.
- * - Supports common video formats (e.g., MP4, MKV).
+ * Command: .reply2mp3 (must reply to a video message)
+ * - Converts the replied video to MP3 format.
+ * - Ensures the user replies to a valid video message.
  *
  * Requirements:
  * - ffmpeg must be installed and available in the system PATH.
  *
  * Usage:
- * - Send a video file to the bot with the caption ".video2mp3".
+ * - Reply to a video with the command ".reply2mp3".
  *
  * Dependencies:
  * - ffmpeg
@@ -22,17 +22,17 @@ const { exec } = require("child_process");
 
 cmd(
   {
-    pattern: "tomp3",
+    pattern: "reply2mp3",
     react: "🎵",
-    desc: "Convert a video attachment to MP3 audio.",
+    desc: "Convert a replied video to MP3.",
     category: "conversion",
     filename: __filename,
   },
-  async (robin, mek, m, { from, reply, quoted, sender }) => {
+  async (robin, mek, m, { from, reply, quoted, senderNumber }) => {
     try {
-      // Ensure the user has sent a video file along with the command
+      // Check if the user replied to a video message
       if (!quoted || !quoted.message || !quoted.message.videoMessage) {
-        return reply("❌ Please reply to a video file with the command '.video2mp3'.");
+        return reply("❌ Please reply to a video message with the command '.reply2mp3'.");
       }
 
       const videoMessage = quoted.message.videoMessage;
@@ -47,10 +47,10 @@ cmd(
       const videoPath = path.join(tempDir, `${Date.now()}_input.mp4`);
       const outputPath = path.join(tempDir, `${Date.now()}_output.mp3`);
 
-      // Ensure temp directory exists
+      // Ensure the temp directory exists
       if (!(await fs.pathExists(tempDir))) await fs.ensureDir(tempDir);
 
-      // Download the video file
+      // Download the replied video
       const videoStream = await robin.downloadAndSaveMediaMessage(quoted, videoPath);
 
       if (!videoStream) {
@@ -107,7 +107,7 @@ cmd(
         }
       });
     } catch (error) {
-      console.error("video2mp3 command error:", error);
+      console.error("reply2mp3 command error:", error);
       reply(`❌ An error occurred: ${error.message || error}`);
     }
   }
