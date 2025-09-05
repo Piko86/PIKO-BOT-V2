@@ -22,7 +22,7 @@ const { exec } = require("child_process");
 
 cmd(
   {
-    pattern: "video2mp3",
+    pattern: "tomp3",
     react: "🎵",
     desc: "Convert a video attachment to MP3 audio.",
     category: "conversion",
