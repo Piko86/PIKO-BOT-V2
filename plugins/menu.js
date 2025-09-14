@@ -301,7 +301,7 @@ ${commandList}➠ *Total Commands in ${selectedMenu.title}*: ${selectedMenu.comm
 
 *Reply with another number (1-10) for more categories!*
 
-*㋛ 𝙿𝙾𝚆𝙴𝚁𝙳 𝙱𝚈 𝙿_𝙸_𝙺_𝙾 〽️*`;
+*㋛ 𝙿𝙾𝚆𝙴𝚁𝙳 𝙱𝚈 𝙿_𝙸_𝙺_𝙾 〽️*`,
 
     const submenuMessage = await robin.sendMessage(
       from,
